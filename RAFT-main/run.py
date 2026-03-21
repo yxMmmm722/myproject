@@ -47,7 +47,7 @@ def apply_data_preset(args):
     if args.freq == DEFAULT_FREQ:
         args.freq = preset['freq']
 
-#test
+#test ss
 if __name__ == '__main__':
     fix_seed = 0
     random.seed(fix_seed)
