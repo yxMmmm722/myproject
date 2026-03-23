@@ -145,6 +145,12 @@ if __name__ == '__main__':
                         help='coarse retrieval top-k using waveform similarity')
     parser.add_argument('--context_dim', type=int, default=64,
                         help='context encoder hidden dimension')
+    parser.add_argument('--gate_hidden_dim', type=int, default=128,
+                        help='hidden dim of candidate gate in retrieval aggregation')
+    parser.add_argument('--period_router_hidden_dim', type=int, default=128,
+                        help='hidden dim of query-adaptive period fusion router')
+    parser.add_argument('--no_gated_aggregation', action='store_true',
+                        help='disable gated candidate aggregation and fallback to context-softmax weighting')
     parser.add_argument('--freeze_context_encoder', action='store_true',
                         help='freeze context encoder and only train alpha/predictor')
     parser.add_argument('--no_refresh_context_each_epoch', action='store_true',
@@ -178,7 +184,24 @@ if __name__ == '__main__':
     parser.add_argument('--patience', type=int, default=10, help='early stopping patience')
     parser.add_argument('--learning_rate', type=float, default=0.0001, help='optimizer learning rate')
     parser.add_argument('--des', type=str, default='test', help='exp description')
-    parser.add_argument('--loss', type=str, default='MSE', help='loss function')
+    parser.add_argument('--loss', type=str, default='qdf_lite',
+                        help='loss function, options:[MSE, qdf_lite]')
+    parser.add_argument('--qdf_beta', type=float, default=0.7,
+                        help='target mixing ratio for quadratic term in qdf_lite')
+    parser.add_argument('--qdf_warmup_epochs', type=int, default=5,
+                        help='linear warmup epochs for qdf beta')
+    parser.add_argument('--qdf_diff_weight', type=float, default=0.15,
+                        help='weight of first-difference consistency loss in qdf_lite')
+    parser.add_argument('--qdf_level_weight', type=float, default=0.05,
+                        help='weight of sequence level-bias loss in qdf_lite')
+    parser.add_argument('--qdf_ema_decay', type=float, default=0.98,
+                        help='ema decay for covariance tracking in qdf_lite')
+    parser.add_argument('--qdf_bandwidth', type=int, default=32,
+                        help='bandwidth for covariance matrix in qdf_lite (<=0 means full)')
+    parser.add_argument('--qdf_update_interval', type=int, default=1,
+                        help='update interval (steps) for covariance tracking in qdf_lite')
+    parser.add_argument('--qdf_eps', type=float, default=1e-5,
+                        help='numerical epsilon for qdf_lite covariance stabilization')
     parser.add_argument('--lradj', type=str, default='cosine', help='adjust learning rate')
     parser.add_argument('--use_amp', action='store_true', help='use automatic mixed precision training', default=False)
 
@@ -224,6 +247,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
     apply_data_preset(args)
     args.refresh_context_each_epoch = not args.no_refresh_context_each_epoch
+    args.use_gated_aggregation = not args.no_gated_aggregation
     # args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
     args.use_gpu = True if torch.cuda.is_available() else False
 
