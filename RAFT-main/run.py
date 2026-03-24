@@ -183,26 +183,10 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=32, help='batch size of train input data')
     parser.add_argument('--patience', type=int, default=10, help='early stopping patience')
     parser.add_argument('--learning_rate', type=float, default=0.0001, help='optimizer learning rate')
+    parser.add_argument('--weight_decay', type=float, default=0.0, help='AdamW weight decay')
     parser.add_argument('--des', type=str, default='test', help='exp description')
-    parser.add_argument('--loss', type=str, default='qdf_lite',
-                        help='loss function, options:[MSE, qdf_lite]')
-    parser.add_argument('--qdf_beta', type=float, default=0.7,
-                        help='target mixing ratio for quadratic term in qdf_lite')
-    parser.add_argument('--qdf_warmup_epochs', type=int, default=5,
-                        help='linear warmup epochs for qdf beta')
-    parser.add_argument('--qdf_diff_weight', type=float, default=0.15,
-                        help='weight of first-difference consistency loss in qdf_lite')
-    parser.add_argument('--qdf_level_weight', type=float, default=0.05,
-                        help='weight of sequence level-bias loss in qdf_lite')
-    parser.add_argument('--qdf_ema_decay', type=float, default=0.98,
-                        help='ema decay for covariance tracking in qdf_lite')
-    parser.add_argument('--qdf_bandwidth', type=int, default=32,
-                        help='bandwidth for covariance matrix in qdf_lite (<=0 means full)')
-    parser.add_argument('--qdf_update_interval', type=int, default=1,
-                        help='update interval (steps) for covariance tracking in qdf_lite')
-    parser.add_argument('--qdf_eps', type=float, default=1e-5,
-                        help='numerical epsilon for qdf_lite covariance stabilization')
-    parser.add_argument('--lradj', type=str, default='cosine', help='adjust learning rate')
+    parser.add_argument('--loss', type=str, default='MSE', help='loss function')
+    parser.add_argument('--lradj', type=str, default='type1', help='adjust learning rate')
     parser.add_argument('--use_amp', action='store_true', help='use automatic mixed precision training', default=False)
 
     # GPU
