@@ -180,6 +180,14 @@ if __name__ == '__main__':
                         help='output directory for dumped meta-text files')
     parser.add_argument('--meta_text_max_samples', type=int, default=200,
                         help='max number of dumped text samples per split')
+    parser.add_argument('--save_retrieval_cases', action='store_true',
+                        help='save wave/meta top-m case plots in test stage')
+    parser.add_argument('--retrieval_case_period_idx', type=int, default=-1,
+                        help='which period index to visualize, -1 means last period')
+    parser.add_argument('--retrieval_case_channel_idx', type=int, default=-1,
+                        help='which channel index to visualize, -1 means last channel')
+    parser.add_argument('--retrieval_case_sample_idx', type=int, default=0,
+                        help='which sample in batch to visualize')
 
     # optimization
     parser.add_argument('--num_workers', type=int, default=10, help='data loader num workers')

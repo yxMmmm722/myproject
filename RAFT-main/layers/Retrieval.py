@@ -645,22 +645,18 @@ class RetrievalTool(nn.Module):
         self_mask = self_mask.unsqueeze(0).repeat(self.n_period, 1, 1)
         return self_mask.bool()
 
-    def retrieve(self, x, index, meta_query=None, train=True):
-        index = index.to(x.device)
-
+    def _compute_wave_and_meta_topm(self, x, index, meta_query=None, train=True, require_grad=False, force_wave=False):
         bsz, seq_len, channels = x.shape
         assert seq_len == self.seq_len and channels == self.channels
-
         select_k = min(self.topm, self.n_train)
-        require_grad = train and self.train_context_encoder and torch.is_grad_enabled()
-        query_ctx = self._encode_query_context(meta_query, bsz, x.device, require_grad=require_grad)  # [G, B, D]
 
+        query_ctx = self._encode_query_context(meta_query, bsz, x.device, require_grad=require_grad)  # [G, B, D]
         self_mask = None
         if train:
             self_mask = self._build_train_self_mask(index, bsz, x.device)  # [G, B, T]
 
-        need_wave = (not self.meta_only_retrieval) or self.compare_retrieval_topk
-        sim_wave = None
+        need_wave = force_wave or (not self.meta_only_retrieval) or self.compare_retrieval_topk
+        sim_wave, wave_idx, wave_score = None, None, None
         if need_wave:
             x_mg, _ = self.decompose_mg(x)  # [G, B, S, C]
             x_key = x_mg.flatten(start_dim=2)  # [G, B, S*C]
@@ -676,19 +672,132 @@ class RetrievalTool(nn.Module):
                 )  # [G, B, T]
             if self_mask is not None:
                 sim_wave = sim_wave.masked_fill(self_mask, float("-inf"))
-
-        # Waveform-only top-k (baseline).
-        wave_idx, wave_score = None, None
-        if sim_wave is not None:
             wave_score, wave_idx = torch.topk(sim_wave, select_k, dim=2)  # [G, B, k]
 
-        # Meta-context-only top-k (your method).
+        # Meta-context-only top-m.
         pool_ctx = self.meta_pool_context.to(x.device)  # [G, T, D]
         pool_ctx_expand = pool_ctx.unsqueeze(1).expand(-1, bsz, -1, -1)  # [G, B, T, D]
         full_context = self.context_similarity(query_ctx, pool_ctx_expand)  # [G, B, T]
         if self_mask is not None:
             full_context = full_context.masked_fill(self_mask, float("-inf"))
         meta_score, meta_idx = torch.topk(full_context, select_k, dim=2)  # [G, B, k]
+
+        return {
+            "select_k": select_k,
+            "query_ctx": query_ctx,
+            "wave_idx": wave_idx,
+            "wave_score": wave_score,
+            "meta_idx": meta_idx,
+            "meta_score": meta_score,
+        }
+
+    def _gather_candidate_hist_future(self, candidate_idx_1d, period_idx, device):
+        candidate_idx_1d = candidate_idx_1d.long()
+        m = int(candidate_idx_1d.shape[0])
+        if m <= 0:
+            return torch.empty((0, self.seq_len, self.channels), device=device), torch.empty((0, self.pred_len, self.channels), device=device)
+
+        if self.train_data_all_mg is not None and self.y_data_all_mg is not None:
+            hist = self.train_data_all_mg[period_idx, candidate_idx_1d].to(device).float()  # [m, S, C]
+            fut = self.y_data_all_mg[period_idx, candidate_idx_1d].to(device).float()  # [m, P, C]
+            return hist, fut
+
+        if self.train_series_x is None or self.train_series_y is None:
+            raise RuntimeError("Neither cached bank nor stream bank is available for retrieval debug export.")
+
+        cand = candidate_idx_1d.to(self.train_series_x.device).unsqueeze(1)  # [m, 1]
+
+        # History windows.
+        off_s = torch.arange(self.seq_len, device=self.train_series_x.device).unsqueeze(0)  # [1, S]
+        x_idx = cand + off_s  # [m, S]
+        raw_x = self.train_series_x.index_select(0, x_idx.reshape(-1)).reshape(m, self.seq_len, self.channels).to(device).float()
+        x_mg, _ = self.decompose_mg(raw_x)
+        hist = x_mg[period_idx]  # [m, S, C]
+
+        # Future windows.
+        off_p = torch.arange(self.pred_len, device=self.train_series_y.device).unsqueeze(0)  # [1, P]
+        y_idx = cand + self.seq_len + off_p  # [m, P]
+        raw_y = self.train_series_y.index_select(0, y_idx.reshape(-1)).reshape(m, self.pred_len, self.channels).to(device).float()
+        g = self.period_num[period_idx]
+        fut = raw_y.unfold(dimension=1, size=g, step=g).mean(dim=-1)
+        fut = fut.repeat_interleave(repeats=g, dim=1)
+        fut = fut - fut[:, -1:, :]
+        return hist, fut
+
+    @torch.no_grad()
+    def export_wave_meta_topm_case(
+        self,
+        x,
+        index,
+        meta_query=None,
+        sample_idx=0,
+        period_idx=-1,
+        channel_idx=-1,
+        train=False,
+    ):
+        index = index.to(x.device)
+        bsz = x.shape[0]
+        sample_idx = max(0, min(int(sample_idx), bsz - 1))
+        if period_idx < 0:
+            period_idx = len(self.period_num) + int(period_idx)
+        period_idx = max(0, min(int(period_idx), len(self.period_num) - 1))
+
+        out = self._compute_wave_and_meta_topm(
+            x=x,
+            index=index,
+            meta_query=meta_query,
+            train=train,
+            require_grad=False,
+            force_wave=True,
+        )
+        wave_idx = out["wave_idx"]  # [G, B, m]
+        meta_idx = out["meta_idx"]  # [G, B, m]
+        select_k = int(out["select_k"])
+
+        if channel_idx < 0:
+            channel_idx = self.channels + int(channel_idx)
+        channel_idx = max(0, min(int(channel_idx), self.channels - 1))
+
+        wave_sel = wave_idx[period_idx, sample_idx, :select_k]
+        meta_sel = meta_idx[period_idx, sample_idx, :select_k]
+        wave_hist, wave_fut = self._gather_candidate_hist_future(wave_sel, period_idx, x.device)
+        meta_hist, meta_fut = self._gather_candidate_hist_future(meta_sel, period_idx, x.device)
+
+        x_mg, _ = self.decompose_mg(x)
+        query_hist = x_mg[period_idx, sample_idx, :, channel_idx].detach().cpu().numpy()
+
+        return {
+            "period_idx": int(period_idx),
+            "period_g": int(self.period_num[period_idx]),
+            "channel_idx": int(channel_idx),
+            "topm": int(select_k),
+            "query_history": query_hist,
+            "wave_topm_idx": wave_sel.detach().cpu().numpy(),
+            "meta_topm_idx": meta_sel.detach().cpu().numpy(),
+            "wave_histories": wave_hist[:, :, channel_idx].detach().cpu().numpy(),
+            "meta_histories": meta_hist[:, :, channel_idx].detach().cpu().numpy(),
+            "wave_futures": wave_fut[:, :, channel_idx].detach().cpu().numpy(),
+            "meta_futures": meta_fut[:, :, channel_idx].detach().cpu().numpy(),
+        }
+
+    def retrieve(self, x, index, meta_query=None, train=True):
+        index = index.to(x.device)
+
+        require_grad = train and self.train_context_encoder and torch.is_grad_enabled()
+        out = self._compute_wave_and_meta_topm(
+            x=x,
+            index=index,
+            meta_query=meta_query,
+            train=train,
+            require_grad=require_grad,
+            force_wave=False,
+        )
+        select_k = int(out["select_k"])
+        query_ctx = out["query_ctx"]
+        wave_idx = out["wave_idx"]
+        wave_score = out["wave_score"]
+        meta_idx = out["meta_idx"]
+        meta_score = out["meta_score"]
 
         # Compare waveform-only top-k vs meta-only top-k.
         if self.compare_retrieval_topk and wave_idx is not None:

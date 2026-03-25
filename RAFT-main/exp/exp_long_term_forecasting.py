@@ -75,6 +75,88 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         except Exception as e:
             print(f"[RetrievalCompare] skip plot save due to matplotlib error: {e}")
 
+    @staticmethod
+    def _save_retrieval_case_viz(case_data, out_dir, tag):
+        if case_data is None:
+            return
+        os.makedirs(out_dir, exist_ok=True)
+
+        query_history = np.asarray(case_data.get("query_history", []), dtype=np.float32)
+        wave_hist = np.asarray(case_data.get("wave_histories", []), dtype=np.float32)
+        meta_hist = np.asarray(case_data.get("meta_histories", []), dtype=np.float32)
+        wave_fut = np.asarray(case_data.get("wave_futures", []), dtype=np.float32)
+        meta_fut = np.asarray(case_data.get("meta_futures", []), dtype=np.float32)
+        true_fut = np.asarray(case_data.get("true_future", []), dtype=np.float32)
+
+        np.save(os.path.join(out_dir, f"{tag}_query_history.npy"), query_history)
+        np.save(os.path.join(out_dir, f"{tag}_wave_histories.npy"), wave_hist)
+        np.save(os.path.join(out_dir, f"{tag}_meta_histories.npy"), meta_hist)
+        np.save(os.path.join(out_dir, f"{tag}_wave_futures.npy"), wave_fut)
+        np.save(os.path.join(out_dir, f"{tag}_meta_futures.npy"), meta_fut)
+        if true_fut.size > 0:
+            np.save(os.path.join(out_dir, f"{tag}_true_future.npy"), true_fut)
+
+        meta_info = {
+            "period_idx": int(case_data.get("period_idx", -1)),
+            "period_g": int(case_data.get("period_g", -1)),
+            "channel_idx": int(case_data.get("channel_idx", -1)),
+            "topm": int(case_data.get("topm", 0)),
+            "wave_topm_idx": list(map(int, case_data.get("wave_topm_idx", []))),
+            "meta_topm_idx": list(map(int, case_data.get("meta_topm_idx", []))),
+        }
+        with open(os.path.join(out_dir, f"{tag}_meta.json"), "w", encoding="utf-8") as f:
+            json.dump(meta_info, f, indent=2, ensure_ascii=False)
+
+        try:
+            import matplotlib.pyplot as plt
+
+            fig, axes = plt.subplots(2, 2, figsize=(14, 8))
+            fig.suptitle(
+                f"Wave vs Meta Top-m Case | period_g={meta_info['period_g']} channel={meta_info['channel_idx']} topm={meta_info['topm']}",
+                fontsize=12,
+            )
+
+            ax = axes[0, 0]
+            if query_history.size > 0:
+                ax.plot(query_history, color="black", linewidth=2.0, label="query history")
+            for i in range(wave_hist.shape[0]):
+                ax.plot(wave_hist[i], alpha=0.35, linewidth=1.0)
+            ax.set_title("Wave Top-m Histories")
+            ax.legend(loc="best")
+
+            ax = axes[0, 1]
+            if query_history.size > 0:
+                ax.plot(query_history, color="black", linewidth=2.0, label="query history")
+            for i in range(meta_hist.shape[0]):
+                ax.plot(meta_hist[i], alpha=0.35, linewidth=1.0)
+            ax.set_title("Meta Top-m Histories")
+            ax.legend(loc="best")
+
+            ax = axes[1, 0]
+            if true_fut.size > 0:
+                ax.plot(true_fut, color="black", linewidth=2.0, label="true future")
+            for i in range(wave_fut.shape[0]):
+                ax.plot(wave_fut[i], alpha=0.35, linewidth=1.0)
+            ax.set_title("Wave Top-m Futures")
+            ax.legend(loc="best")
+
+            ax = axes[1, 1]
+            if true_fut.size > 0:
+                ax.plot(true_fut, color="black", linewidth=2.0, label="true future")
+            for i in range(meta_fut.shape[0]):
+                ax.plot(meta_fut[i], alpha=0.35, linewidth=1.0)
+            ax.set_title("Meta Top-m Futures")
+            ax.legend(loc="best")
+
+            for ax in axes.reshape(-1):
+                ax.grid(alpha=0.2)
+
+            plt.tight_layout()
+            plt.savefig(os.path.join(out_dir, f"{tag}_panel.png"), dpi=150)
+            plt.close(fig)
+        except Exception as e:
+            print(f"[RetrievalCase] skip plot save due to matplotlib error: {e}")
+
     def _build_model(self):
         model = self.model_dict[self.args.model].Model(self.args).float()
 
@@ -292,7 +374,9 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         self.model.eval()
         amp_enabled = self.args.use_amp and self.args.use_gpu
         cmp_stats_test = None
+        case_saved = False
         with torch.no_grad():
+            raft_model = None
             if self.args.model == 'RAFT':
                 raft_model = self._raft_model()
                 if hasattr(raft_model, "reset_retrieval_compare_stats"):
@@ -304,6 +388,49 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
                 batch_x_mark = batch_x_mark.float().to(self.device)
                 batch_y_mark = batch_y_mark.float().to(self.device)
+
+                if (
+                    self.args.model == 'RAFT'
+                    and (not case_saved)
+                    and getattr(self.args, "save_retrieval_cases", False)
+                    and raft_model is not None
+                    and hasattr(raft_model, "export_wave_meta_topm_case")
+                ):
+                    case_data = raft_model.export_wave_meta_topm_case(
+                        x=batch_x,
+                        index=index,
+                        meta_data=meta_data,
+                        sample_idx=getattr(self.args, "retrieval_case_sample_idx", 0),
+                        period_idx=getattr(self.args, "retrieval_case_period_idx", -1),
+                        channel_idx=getattr(self.args, "retrieval_case_channel_idx", -1),
+                        train=False,
+                    )
+                    if case_data is not None:
+                        sample_idx = int(getattr(self.args, "retrieval_case_sample_idx", 0))
+                        sample_idx = max(0, min(sample_idx, batch_x.shape[0] - 1))
+                        channel_idx = int(case_data.get("channel_idx", -1))
+                        period_idx = int(case_data.get("period_idx", -1))
+                        batch_y_future = batch_y[:, -self.args.pred_len:, :]
+                        true_future = None
+                        if (
+                            hasattr(raft_model, "rt")
+                            and hasattr(raft_model.rt, "decompose_mg")
+                            and 0 <= period_idx < len(getattr(raft_model.rt, "period_num", []))
+                            and 0 <= channel_idx < batch_y_future.shape[-1]
+                        ):
+                            y_mg, _ = raft_model.rt.decompose_mg(batch_y_future)
+                            true_future = y_mg[period_idx, sample_idx, :, channel_idx].detach().cpu().numpy()
+                        elif 0 <= channel_idx < batch_y_future.shape[-1]:
+                            true_future = batch_y_future[sample_idx, :, channel_idx].detach().cpu().numpy()
+
+                        if true_future is not None:
+                            case_data["true_future"] = true_future
+                        self._save_retrieval_case_viz(
+                            case_data=case_data,
+                            out_dir=os.path.join(folder_path, "retrieval_cases"),
+                            tag="test_case_0",
+                        )
+                        case_saved = True
 
                 # decoder input
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()

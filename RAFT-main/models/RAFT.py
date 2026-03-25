@@ -197,6 +197,23 @@ class Model(nn.Module):
             return self.rt.get_retrieval_compare_stats()
         return None
 
+    def export_wave_meta_topm_case(self, x, index, meta_data=None, sample_idx=0, period_idx=-1, channel_idx=-1, train=False):
+        if not self.online_retrieval:
+            return None
+        if not hasattr(self, "rt"):
+            return None
+        if not hasattr(self.rt, "export_wave_meta_topm_case"):
+            return None
+        return self.rt.export_wave_meta_topm_case(
+            x=x,
+            index=index,
+            meta_query=meta_data,
+            sample_idx=sample_idx,
+            period_idx=period_idx,
+            channel_idx=channel_idx,
+            train=train,
+        )
+
     def _get_text_feature(self, index, mode, bsz, meta_text=None):
         return torch.zeros((bsz, 0), device=self.device)
 
