@@ -62,11 +62,6 @@ def print_args(args):
     print(f'  {"Patience:":<20}{args.patience:<20}{"Learning Rate:":<20}{args.learning_rate:<20}')
     print(f'  {"Des:":<20}{args.des:<20}{"Loss:":<20}{args.loss:<20}')
     print(f'  {"Lradj:":<20}{args.lradj:<20}{"Use Amp:":<20}{args.use_amp:<20}')
-    if hasattr(args, "qdf_beta"):
-        print(f'  {"QDF Beta:":<20}{args.qdf_beta:<20}{"QDF Warmup:":<20}{args.qdf_warmup_epochs:<20}')
-        print(f'  {"QDF Diff W:":<20}{args.qdf_diff_weight:<20}{"QDF Level W:":<20}{args.qdf_level_weight:<20}')
-        print(f'  {"QDF EMA:":<20}{args.qdf_ema_decay:<20}{"QDF Bandwidth:":<20}{args.qdf_bandwidth:<20}')
-        print(f'  {"QDF Update Int:":<20}{args.qdf_update_interval:<20}{"QDF Eps:":<20}{args.qdf_eps:<20}')
     print()
 
     print("\033[1m" + "GPU" + "\033[0m")

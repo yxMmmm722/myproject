@@ -2,7 +2,6 @@ from data_provider.data_factory import data_provider
 from exp.exp_basic import Exp_Basic
 from utils.tools import EarlyStopping, adjust_learning_rate, visual
 from utils.metrics import metric
-from utils.losses import QDFLiteLoss
 import torch
 import torch.nn as nn
 from torch import optim
@@ -54,28 +53,12 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         return model_optim
 
     def _select_criterion(self):
-        loss_name = str(getattr(self.args, "loss", "MSE")).lower()
-        if loss_name in ["qdf_lite", "qdflite", "qdf"]:
-            criterion = QDFLiteLoss(
-                pred_len=self.args.pred_len,
-                qdf_beta=getattr(self.args, "qdf_beta", 0.7),
-                qdf_warmup_epochs=getattr(self.args, "qdf_warmup_epochs", 5),
-                qdf_diff_weight=getattr(self.args, "qdf_diff_weight", 0.15),
-                qdf_level_weight=getattr(self.args, "qdf_level_weight", 0.05),
-                qdf_ema_decay=getattr(self.args, "qdf_ema_decay", 0.98),
-                qdf_bandwidth=getattr(self.args, "qdf_bandwidth", 32),
-                qdf_update_interval=getattr(self.args, "qdf_update_interval", 1),
-                qdf_eps=getattr(self.args, "qdf_eps", 1e-5),
-            )
-        else:
-            criterion = nn.MSELoss()
-        return criterion.to(self.device)
+        criterion = nn.MSELoss()
+        return criterion
 
     def vali(self, vali_data, vali_loader, criterion, split_mode='valid'):
         total_loss = []
         self.model.eval()
-        criterion_was_training = criterion.training
-        criterion.eval()
         amp_enabled = self.args.use_amp and self.args.use_gpu
         with torch.no_grad():
             for i, batch in enumerate(vali_loader):
@@ -115,12 +98,9 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, f_dim:]
                 batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
-
                 loss = criterion(outputs, batch_y)
                 total_loss.append(loss.item())
         total_loss = float(np.average(total_loss))
-        if criterion_was_training:
-            criterion.train()
         self.model.train()
         return total_loss
 
@@ -149,9 +129,6 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             train_loss = []
 
             self.model.train()
-            criterion.train()
-            if hasattr(criterion, "set_epoch"):
-                criterion.set_epoch(epoch)
             if self.args.model == 'RAFT':
                 raft_model = self._raft_model()
                 if hasattr(raft_model, "refresh_retrieval_bank"):

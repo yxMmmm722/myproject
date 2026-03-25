@@ -10,7 +10,7 @@ RUN_FILE="${RUN_FILE:-run.py}"
 BERT_PATH="${BERT_PATH:-./models/bert-base-uncased}"
 
 # Training hyper-parameters (override by env vars if needed).
-SEQ_LEN="${SEQ_LEN:-96}"
+SEQ_LEN="${SEQ_LEN:-720}"
 LABEL_LEN="${LABEL_LEN:-48}"
 PRED_LENS_STR="${PRED_LENS:-96 192 336 720}"  # default: paper-style horizons
 ILLNESS_PRED_LENS_STR="${ILLNESS_PRED_LENS:-24 36 48 60}"  # dataset-specific default for illness
@@ -19,8 +19,9 @@ TOPM="${TOPM:-20}"
 RETRIEVAL_COARSE_K="${RETRIEVAL_COARSE_K:-80}"
 CONTEXT_DIM="${CONTEXT_DIM:-64}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
-TRAIN_EPOCHS="${TRAIN_EPOCHS:-20}"
+TRAIN_EPOCHS="${TRAIN_EPOCHS:-10}"
 LEARNING_RATE="${LEARNING_RATE:-0.0001}"
+LRADJ="${LRADJ:-type1}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 MODEL_PREFIX="${MODEL_PREFIX:-HCAR}"
 USE_TABLE6_PRESETS="${USE_TABLE6_PRESETS:-1}"  # 1: use dataset/pred specific seq_len/lr/topm from Table 6
@@ -280,7 +281,7 @@ run_one() {
 
   echo "============================================================"
   echo "[RUN ] dataset=${dataset} pred_len=${pred_len} channels=${channels}"
-  echo "[CFG ] seq_len=${seq_len} lr=${learning_rate} topm=${topm} preset=${preset_source} cache=${retrieval_cache_device_run}/${text_cache_device_run}"
+  echo "[CFG ] seq_len=${seq_len} lr=${learning_rate} lradj=${LRADJ} topm=${topm} preset=${preset_source} cache=${retrieval_cache_device_run}/${text_cache_device_run}"
   echo "[LOG ] ${log_file}"
   echo "============================================================"
 
@@ -300,7 +301,7 @@ run_one() {
     --text_cache_device "${text_cache_device_run}"
     --text_encoder_name "${BERT_PATH}"
     --batch_size "${BATCH_SIZE}" --train_epochs "${TRAIN_EPOCHS}"
-    --learning_rate "${learning_rate}" --lradj cosine --num_workers "${num_workers_run}"
+    --learning_rate "${learning_rate}" --lradj "${LRADJ}" --num_workers "${num_workers_run}"
   )
 
   if [[ "${SAVE_META_TEXTS}" == "1" ]]; then
