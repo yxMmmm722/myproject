@@ -15,19 +15,33 @@ class HierarchicalContextEncoder(nn.Module):
         super().__init__()
         self.period_count = period_count
 
-        # Layer-1 and Layer-2 categorical embeddings.
+        # Layer-1/2 categorical embeddings (dataset + temporal + scenario ids).
         self.dataset_emb = nn.Embedding(2048, cat_dim)
         self.sensor_emb = nn.Embedding(256, cat_dim)
         self.location_emb = nn.Embedding(4096, cat_dim)
         self.hour_emb = nn.Embedding(24, cat_dim)
         self.weekday_emb = nn.Embedding(7, cat_dim)
         self.month_emb = nn.Embedding(13, cat_dim)
+        self.week_emb = nn.Embedding(54, cat_dim)
+        self.season_emb = nn.Embedding(4, cat_dim)
         self.holiday_emb = nn.Embedding(2, cat_dim)
         self.peak_emb = nn.Embedding(2, cat_dim)
+        self.regime_emb = nn.Embedding(16, cat_dim)
+        self.event_emb = nn.Embedding(8, cat_dim)
+        self.trend_state_emb = nn.Embedding(3, cat_dim)
+        self.vol_state_emb = nn.Embedding(3, cat_dim)
+        self.shape_state_emb = nn.Embedding(3, cat_dim)
+        self.reliability_emb = nn.Embedding(3, cat_dim)
+        self.month_end_emb = nn.Embedding(2, cat_dim)
 
-        cat_total_dim = cat_dim * 8
+        cat_total_dim = cat_dim * 17
         self.cat_proj = nn.Sequential(
             nn.Linear(cat_total_dim, context_dim),
+            nn.GELU(),
+            nn.Linear(context_dim, context_dim),
+        )
+        self.exo_proj = nn.Sequential(
+            nn.Linear(8, context_dim),
             nn.GELU(),
             nn.Linear(context_dim, context_dim),
         )
@@ -47,8 +61,17 @@ class HierarchicalContextEncoder(nn.Module):
         hour = meta_batch["hour"].long().clamp(0, 23)
         weekday = meta_batch["day_of_week"].long().clamp(0, 6)
         month = meta_batch["month"].long().clamp(1, 12)
+        week = meta_batch["week_of_year"].long().clamp(1, 53)
+        season = meta_batch["season_id"].long().clamp(0, 3)
         holiday = meta_batch["is_holiday"].long().clamp(0, 1)
         peak = meta_batch["peak_status_id"].long().clamp(0, 1)
+        regime = meta_batch["regime_id"].long().clamp(0, 15)
+        event = meta_batch["event_id"].long().clamp(0, 7)
+        trend_state = meta_batch["trend_state_id"].long().clamp(0, 2)
+        vol_state = meta_batch["volatility_state_id"].long().clamp(0, 2)
+        shape_state = meta_batch["shape_state_id"].long().clamp(0, 2)
+        reliability = meta_batch["reliability_id"].long().clamp(0, 2)
+        month_end = meta_batch["month_end_flag"].long().clamp(0, 1)
 
         cat_context = torch.cat(
             [
@@ -58,12 +81,24 @@ class HierarchicalContextEncoder(nn.Module):
                 self.hour_emb(hour),
                 self.weekday_emb(weekday),
                 self.month_emb(month),
+                self.week_emb(week),
+                self.season_emb(season),
                 self.holiday_emb(holiday),
                 self.peak_emb(peak),
+                self.regime_emb(regime),
+                self.event_emb(event),
+                self.trend_state_emb(trend_state),
+                self.vol_state_emb(vol_state),
+                self.shape_state_emb(shape_state),
+                self.reliability_emb(reliability),
+                self.month_end_emb(month_end),
             ],
             dim=1,
         )
         cat_context = self.cat_proj(cat_context)  # [B, D]
+        exogenous = meta_batch["exogenous_vars"].float()
+        exo_context = self.exo_proj(exogenous)  # [B, D]
+        cat_context = cat_context + exo_context
 
         local_state = meta_batch["local_state_by_period"].float()  # [B, G, 4]
         local_state = local_state[:, : self.period_count, :]
@@ -92,6 +127,9 @@ class RetrievalTool(nn.Module):
         return_key=False,
         learnable_alpha=False,
         train_context_encoder=True,
+        meta_only_retrieval=False,
+        compare_retrieval_topk=False,
+        compare_log_interval=100,
     ):
         super().__init__()
         base_periods = [4, 2, 1]
@@ -110,6 +148,9 @@ class RetrievalTool(nn.Module):
         self.train_context_encoder = bool(train_context_encoder)
         self.context_dim = int(context_dim)
         self.use_gated_aggregation = bool(use_gated_aggregation)
+        self.meta_only_retrieval = bool(meta_only_retrieval)
+        self.compare_retrieval_topk = bool(compare_retrieval_topk)
+        self.compare_log_interval = int(compare_log_interval)
 
         self.learnable_alpha = learnable_alpha
         if self.learnable_alpha:
@@ -140,6 +181,8 @@ class RetrievalTool(nn.Module):
 
         self.local_state_mean = None
         self.local_state_std = None
+        self.exogenous_mean = None
+        self.exogenous_std = None
         self.meta_pool_context = None
         self.train_meta_all = None
         self.low_mem_stream = False
@@ -150,6 +193,7 @@ class RetrievalTool(nn.Module):
         self.y_data_all_mg = None
         self.train_series_x = None
         self.train_series_y = None
+        self.reset_retrieval_compare_stats()
 
     @staticmethod
     def _to_tensor(value, dtype=torch.float32):
@@ -171,9 +215,19 @@ class RetrievalTool(nn.Module):
             "hour": [],
             "day_of_week": [],
             "month": [],
+            "week_of_year": [],
+            "season_id": [],
             "is_holiday": [],
             "peak_status_id": [],
+            "regime_id": [],
+            "event_id": [],
+            "trend_state_id": [],
+            "volatility_state_id": [],
+            "shape_state_id": [],
+            "reliability_id": [],
+            "month_end_flag": [],
         }
+        exogenous_list = []
 
         for meta in records:
             meta = meta or {}
@@ -183,8 +237,17 @@ class RetrievalTool(nn.Module):
             packed["hour"].append(int(meta.get("hour", 0)))
             packed["day_of_week"].append(int(meta.get("day_of_week", 0)))
             packed["month"].append(int(meta.get("month", 1)))
+            packed["week_of_year"].append(int(meta.get("week_of_year", 1)))
+            packed["season_id"].append(int(meta.get("season_id", 0)))
             packed["is_holiday"].append(int(meta.get("is_holiday", 0)))
             packed["peak_status_id"].append(int(meta.get("peak_status_id", 0)))
+            packed["regime_id"].append(int(meta.get("regime_id", meta.get("peak_status_id", 0))))
+            packed["event_id"].append(int(meta.get("event_id", 0)))
+            packed["trend_state_id"].append(int(meta.get("trend_state_id", 1)))
+            packed["volatility_state_id"].append(int(meta.get("volatility_state_id", 1)))
+            packed["shape_state_id"].append(int(meta.get("shape_state_id", 1)))
+            packed["reliability_id"].append(int(meta.get("reliability_id", 1)))
+            packed["month_end_flag"].append(int(meta.get("month_end_flag", 0)))
 
             local_state = meta.get("local_state_by_period", np.zeros((3, 4), dtype=np.float32))
             local_state = np.asarray(local_state, dtype=np.float32)
@@ -195,8 +258,14 @@ class RetrievalTool(nn.Module):
                 local_state = np.concatenate([local_state, pad], axis=0)
             local_state_list.append(local_state[:3, :4])
 
+            exogenous = np.asarray(meta.get("exogenous_vars", np.zeros((8,), dtype=np.float32)), dtype=np.float32).reshape(-1)
+            if exogenous.shape[0] < 8:
+                exogenous = np.concatenate([exogenous, np.zeros((8 - exogenous.shape[0],), dtype=np.float32)], axis=0)
+            exogenous_list.append(exogenous[:8])
+
         out = {k: torch.tensor(v, dtype=torch.long) for k, v in packed.items()}
         out["local_state_by_period"] = torch.tensor(np.stack(local_state_list, axis=0), dtype=torch.float32)
+        out["exogenous_vars"] = torch.tensor(np.stack(exogenous_list, axis=0), dtype=torch.float32)
         return out
 
     def _meta_from_batch(self, meta_data, bsz):
@@ -206,6 +275,25 @@ class RetrievalTool(nn.Module):
 
         if isinstance(meta_data, dict):
             out = {}
+            key_defaults = {
+                "dataset_id": 0,
+                "sensor_type_id": 0,
+                "physical_location_id": 0,
+                "hour": 0,
+                "day_of_week": 0,
+                "month": 1,
+                "week_of_year": 1,
+                "season_id": 0,
+                "is_holiday": 0,
+                "peak_status_id": 0,
+                "regime_id": 0,
+                "event_id": 0,
+                "trend_state_id": 1,
+                "volatility_state_id": 1,
+                "shape_state_id": 1,
+                "reliability_id": 1,
+                "month_end_flag": 0,
+            }
             for key in [
                 "dataset_id",
                 "sensor_type_id",
@@ -213,10 +301,19 @@ class RetrievalTool(nn.Module):
                 "hour",
                 "day_of_week",
                 "month",
+                "week_of_year",
+                "season_id",
                 "is_holiday",
                 "peak_status_id",
+                "regime_id",
+                "event_id",
+                "trend_state_id",
+                "volatility_state_id",
+                "shape_state_id",
+                "reliability_id",
+                "month_end_flag",
             ]:
-                value = meta_data.get(key, 0)
+                value = meta_data.get(key, key_defaults[key])
                 value = self._to_tensor(value, dtype=torch.float32).long()
                 if value.dim() == 0:
                     value = value.unsqueeze(0)
@@ -241,6 +338,22 @@ class RetrievalTool(nn.Module):
                 pad = torch.zeros((bsz - local_state.shape[0], local_state.shape[1], local_state.shape[2]))
                 local_state = torch.cat([local_state, pad], dim=0)
             out["local_state_by_period"] = local_state[:, :3, :4]
+
+            exogenous = meta_data.get("exogenous_vars", torch.zeros((bsz, 8)))
+            exogenous = self._to_tensor(exogenous, dtype=torch.float32)
+            if exogenous.dim() == 1:
+                exogenous = exogenous.unsqueeze(0)
+            if exogenous.shape[0] == 1 and bsz > 1:
+                exogenous = exogenous.repeat(bsz, 1)
+            if exogenous.shape[0] > bsz:
+                exogenous = exogenous[:bsz]
+            if exogenous.shape[0] < bsz:
+                pad = torch.zeros((bsz - exogenous.shape[0], exogenous.shape[1]))
+                exogenous = torch.cat([exogenous, pad], dim=0)
+            if exogenous.shape[1] < 8:
+                pad = torch.zeros((exogenous.shape[0], 8 - exogenous.shape[1]))
+                exogenous = torch.cat([exogenous, pad], dim=1)
+            out["exogenous_vars"] = exogenous[:, :8]
             return out
 
         if isinstance(meta_data, list):
@@ -256,12 +369,23 @@ class RetrievalTool(nn.Module):
         std = self.local_state_std.to(local_state.device)
         return (local_state - mean) / std
 
+    def _normalize_exogenous(self, exogenous):
+        if self.exogenous_mean is None or self.exogenous_std is None:
+            return exogenous
+        mean = self.exogenous_mean.to(exogenous.device)
+        std = self.exogenous_std.to(exogenous.device)
+        return (exogenous - mean) / std
+
     def _normalize_meta_batch(self, meta_batch, device):
         norm_batch = {}
         for key, value in meta_batch.items():
             if key == "local_state_by_period":
                 v = value.float()
                 v = self._normalize_local_state(v)
+                norm_batch[key] = v.to(device)
+            elif key == "exogenous_vars":
+                v = value.float()
+                v = self._normalize_exogenous(v)
                 norm_batch[key] = v.to(device)
             else:
                 norm_batch[key] = value.long().to(device)
@@ -360,6 +484,9 @@ class RetrievalTool(nn.Module):
         local_state = self.train_meta_all["local_state_by_period"].float()  # [T, 3, 4]
         self.local_state_mean = local_state.mean(dim=0, keepdim=True)
         self.local_state_std = local_state.std(dim=0, keepdim=True) + 1e-6
+        exogenous = self.train_meta_all["exogenous_vars"].float()  # [T, 8]
+        self.exogenous_mean = exogenous.mean(dim=0, keepdim=True)
+        self.exogenous_std = exogenous.std(dim=0, keepdim=True) + 1e-6
 
         self.refresh_context_pool(device=cache_device)
         if self.train_context_encoder:
@@ -440,60 +567,150 @@ class RetrievalTool(nn.Module):
         cand_norm = F.normalize(candidate_ctx, dim=-1)  # [G, B, K, D]
         return (query_norm * cand_norm).sum(dim=-1)  # [G, B, K]
 
+    def reset_retrieval_compare_stats(self):
+        self.compare_stat_calls = 0
+        self.compare_overlap_sum = 0.0
+        self.compare_exact_set_sum = 0.0
+        self.compare_exact_order_sum = 0.0
+        self.compare_pair_count = 0
+        self.compare_rank_match_sum = np.zeros((self.topm,), dtype=np.float64)
+        self.compare_overlap_hist = np.zeros((self.topm + 1,), dtype=np.float64)
+        self.compare_first_example = None
+
+    def get_retrieval_compare_stats(self):
+        if self.compare_stat_calls <= 0:
+            return None
+        calls = float(self.compare_stat_calls)
+        pair_cnt = max(float(self.compare_pair_count), 1.0)
+        return {
+            "calls": int(self.compare_stat_calls),
+            "overlap_ratio": self.compare_overlap_sum / calls,
+            "exact_set_ratio": self.compare_exact_set_sum / calls,
+            "exact_order_ratio": self.compare_exact_order_sum / calls,
+            "m": int(self.topm),
+            "rank_match_ratio": (self.compare_rank_match_sum / pair_cnt).tolist(),
+            "overlap_hist_ratio": (self.compare_overlap_hist / pair_cnt).tolist(),
+            "first_example": self.compare_first_example,
+        }
+
+    def _update_retrieval_compare_stats(self, wave_idx, meta_idx):
+        topm = min(self.topm, wave_idx.shape[-1], meta_idx.shape[-1])
+        if topm <= 0:
+            return
+        wave_top = wave_idx[:, :, :topm]
+        meta_top = meta_idx[:, :, :topm]
+
+        # Set-level overlap@m.
+        overlap_cnt = (wave_top.unsqueeze(-1) == meta_top.unsqueeze(-2)).any(dim=-1).float().sum(dim=-1)  # [G, B]
+        overlap_ratio = overlap_cnt / float(topm)
+        exact_set = (overlap_cnt == float(topm)).float()
+        # Order-level exact match.
+        exact_order = (wave_top == meta_top).all(dim=-1).float()
+        rank_match = (wave_top == meta_top).float().sum(dim=(0, 1))  # [m]
+
+        self.compare_stat_calls += 1
+        self.compare_overlap_sum += float(overlap_ratio.mean().item())
+        self.compare_exact_set_sum += float(exact_set.mean().item())
+        self.compare_exact_order_sum += float(exact_order.mean().item())
+        self.compare_pair_count += int(wave_top.shape[0] * wave_top.shape[1])
+        self.compare_rank_match_sum[:topm] += rank_match.detach().cpu().numpy()
+
+        hist = torch.bincount(overlap_cnt.long().reshape(-1), minlength=topm + 1).float().cpu().numpy()
+        self.compare_overlap_hist[: topm + 1] += hist
+        if self.compare_first_example is None:
+            self.compare_first_example = {
+                "wave_topm": wave_top[0, 0].detach().cpu().tolist(),
+                "meta_topm": meta_top[0, 0].detach().cpu().tolist(),
+            }
+
+        if self.compare_log_interval > 0 and (self.compare_stat_calls % self.compare_log_interval == 0):
+            stats = self.get_retrieval_compare_stats()
+            print(
+                "[RetrievalCompare] "
+                f"calls={stats['calls']} "
+                f"overlap@m={stats['overlap_ratio']:.4f} "
+                f"exact_set={stats['exact_set_ratio']:.4f} "
+                f"exact_order={stats['exact_order_ratio']:.4f}"
+            )
+
+    def _build_train_self_mask(self, index, bsz, device):
+        sliding_index = torch.arange(2 * (self.seq_len + self.pred_len) - 1, device=device)
+        sliding_index = sliding_index.unsqueeze(0).repeat(len(index), 1)
+        sliding_index = sliding_index + (index - self.seq_len - self.pred_len + 1).unsqueeze(1)
+        sliding_index = torch.where(sliding_index >= 0, sliding_index, 0)
+        sliding_index = torch.where(sliding_index < self.n_train, sliding_index, self.n_train - 1)
+
+        self_mask = torch.zeros((bsz, self.n_train), device=device)
+        self_mask = self_mask.scatter_(1, sliding_index, 1.0)
+        self_mask = self_mask.unsqueeze(0).repeat(self.n_period, 1, 1)
+        return self_mask.bool()
+
     def retrieve(self, x, index, meta_query=None, train=True):
         index = index.to(x.device)
 
         bsz, seq_len, channels = x.shape
         assert seq_len == self.seq_len and channels == self.channels
 
-        # Numerical branch with offset removal.
-        x_mg, _ = self.decompose_mg(x)  # [G, B, S, C]
-        x_key = x_mg.flatten(start_dim=2)  # [G, B, S*C]
-        if self.train_data_all_mg is not None:
-            sim_wave = self.periodic_batch_corr(
-                self.train_data_all_mg.flatten(start_dim=2),  # [G, T, S*C]
-                x_key,
-            )  # [G, B, T]
-        else:
-            sim_wave = self.periodic_batch_corr_stream(
-                x_key,
-                in_bsz=self.stream_batch_size,
-            )  # [G, B, T]
-
-        if train:
-            sliding_index = torch.arange(2 * (self.seq_len + self.pred_len) - 1).to(x.device)
-            sliding_index = sliding_index.unsqueeze(0).repeat(len(index), 1)
-            sliding_index = sliding_index + (index - self.seq_len - self.pred_len + 1).unsqueeze(1)
-            sliding_index = torch.where(sliding_index >= 0, sliding_index, 0)
-            sliding_index = torch.where(sliding_index < self.n_train, sliding_index, self.n_train - 1)
-
-            self_mask = torch.zeros((bsz, self.n_train), device=x.device)
-            self_mask = self_mask.scatter_(1, sliding_index, 1.0)
-            self_mask = self_mask.unsqueeze(0).repeat(self.n_period, 1, 1)
-            sim_wave = sim_wave.masked_fill_(self_mask.bool(), float("-inf"))
-
-        # Stage-1 coarse retrieval by waveform similarity.
-        coarse_k = min(self.coarse_k, self.n_train)
-        coarse_wave, coarse_idx = torch.topk(sim_wave, coarse_k, dim=2)
-
-        # Stage-2 contextual reranking inside waveform coarse candidates only.
+        select_k = min(self.topm, self.n_train)
         require_grad = train and self.train_context_encoder and torch.is_grad_enabled()
         query_ctx = self._encode_query_context(meta_query, bsz, x.device, require_grad=require_grad)  # [G, B, D]
-        coarse_candidate_ctx = self._gather_candidate_context(coarse_idx, x.device)  # [G, B, K, D]
-        coarse_context = self.context_similarity(query_ctx, coarse_candidate_ctx)  # [G, B, K]
 
-        select_k = min(self.topm, coarse_k)
-        selected_context, selected_local_idx = torch.topk(coarse_context, select_k, dim=2)
-        selected_global_idx = torch.gather(coarse_idx, dim=2, index=selected_local_idx)
-        selected_wave = torch.gather(coarse_wave, dim=2, index=selected_local_idx)
-        selected_ctx = torch.gather(
-            coarse_candidate_ctx,
-            dim=2,
-            index=selected_local_idx.unsqueeze(-1).expand(-1, -1, -1, coarse_candidate_ctx.shape[-1]),
-        )  # [G, B, m, D]
+        self_mask = None
+        if train:
+            self_mask = self._build_train_self_mask(index, bsz, x.device)  # [G, B, T]
+
+        need_wave = (not self.meta_only_retrieval) or self.compare_retrieval_topk
+        sim_wave = None
+        if need_wave:
+            x_mg, _ = self.decompose_mg(x)  # [G, B, S, C]
+            x_key = x_mg.flatten(start_dim=2)  # [G, B, S*C]
+            if self.train_data_all_mg is not None:
+                sim_wave = self.periodic_batch_corr(
+                    self.train_data_all_mg.flatten(start_dim=2),  # [G, T, S*C]
+                    x_key,
+                )  # [G, B, T]
+            else:
+                sim_wave = self.periodic_batch_corr_stream(
+                    x_key,
+                    in_bsz=self.stream_batch_size,
+                )  # [G, B, T]
+            if self_mask is not None:
+                sim_wave = sim_wave.masked_fill(self_mask, float("-inf"))
+
+        # Waveform-only top-k (baseline).
+        wave_idx, wave_score = None, None
+        if sim_wave is not None:
+            wave_score, wave_idx = torch.topk(sim_wave, select_k, dim=2)  # [G, B, k]
+
+        # Meta-context-only top-k (your method).
+        pool_ctx = self.meta_pool_context.to(x.device)  # [G, T, D]
+        pool_ctx_expand = pool_ctx.unsqueeze(1).expand(-1, bsz, -1, -1)  # [G, B, T, D]
+        full_context = self.context_similarity(query_ctx, pool_ctx_expand)  # [G, B, T]
+        if self_mask is not None:
+            full_context = full_context.masked_fill(self_mask, float("-inf"))
+        meta_score, meta_idx = torch.topk(full_context, select_k, dim=2)  # [G, B, k]
+
+        # Compare waveform-only top-k vs meta-only top-k.
+        if self.compare_retrieval_topk and wave_idx is not None:
+            self._update_retrieval_compare_stats(wave_idx, meta_idx)
+
+        # Choose retrieval candidate source.
+        if self.meta_only_retrieval:
+            selected_global_idx = meta_idx
+            selected_context = meta_score
+            selected_wave = torch.zeros_like(selected_context)
+        else:
+            if wave_idx is None:
+                raise RuntimeError("Waveform similarity is unavailable for waveform-only retrieval.")
+            selected_global_idx = wave_idx
+            selected_wave = wave_score
+
+        selected_ctx = self._gather_candidate_context(selected_global_idx, x.device)  # [G, B, k, D]
+        if not self.meta_only_retrieval:
+            selected_context = self.context_similarity(query_ctx, selected_ctx)  # [G, B, k]
 
         if self.use_gated_aggregation:
-            query_expand = query_ctx.unsqueeze(2).expand(-1, -1, select_k, -1)  # [G, B, m, D]
+            query_expand = query_ctx.unsqueeze(2).expand(-1, -1, select_k, -1)  # [G, B, k, D]
             gate_input = torch.cat(
                 [
                     query_expand,
@@ -502,11 +719,12 @@ class RetrievalTool(nn.Module):
                     selected_context.unsqueeze(-1),
                 ],
                 dim=-1,
-            )  # [G, B, m, 2D+2]
-            gate_logits = self.candidate_gate(gate_input).squeeze(-1)  # [G, B, m]
+            )  # [G, B, k, 2D+2]
+            gate_logits = self.candidate_gate(gate_input).squeeze(-1)  # [G, B, k]
             ranking_prob = F.softmax(gate_logits, dim=2)
         else:
-            ranking_prob = F.softmax(selected_context / self.temperature, dim=2)
+            base_score = selected_context if self.meta_only_retrieval else selected_wave
+            ranking_prob = F.softmax(base_score / self.temperature, dim=2)
 
         if self.y_data_all_mg is not None:
             y_data_all = self.y_data_all_mg.flatten(start_dim=2).to(x.device)  # [G, T, P*C]

@@ -18,6 +18,8 @@ N_PERIOD="${N_PERIOD:-3}"
 TOPM="${TOPM:-20}"
 RETRIEVAL_COARSE_K="${RETRIEVAL_COARSE_K:-80}"
 CONTEXT_DIM="${CONTEXT_DIM:-64}"
+META_ONLY_RETRIEVAL="${META_ONLY_RETRIEVAL:-1}"  # 1: use one-shot meta-context retrieval only
+COMPARE_RETRIEVAL_TOPM="${COMPARE_RETRIEVAL_TOPM:-${COMPARE_RETRIEVAL_TOPK:-1}}"  # 1: compare top-m overlap of waveform-only vs meta-only
 BATCH_SIZE="${BATCH_SIZE:-32}"
 TRAIN_EPOCHS="${TRAIN_EPOCHS:-10}"
 LEARNING_RATE="${LEARNING_RATE:-0.0001}"
@@ -281,7 +283,7 @@ run_one() {
 
   echo "============================================================"
   echo "[RUN ] dataset=${dataset} pred_len=${pred_len} channels=${channels}"
-  echo "[CFG ] seq_len=${seq_len} lr=${learning_rate} lradj=${LRADJ} topm=${topm} preset=${preset_source} cache=${retrieval_cache_device_run}/${text_cache_device_run}"
+  echo "[CFG ] seq_len=${seq_len} lr=${learning_rate} lradj=${LRADJ} topm=${topm} meta_only=${META_ONLY_RETRIEVAL} cmp_topm=${COMPARE_RETRIEVAL_TOPM}:${topm} preset=${preset_source} cache=${retrieval_cache_device_run}/${text_cache_device_run}"
   echo "[LOG ] ${log_file}"
   echo "============================================================"
 
@@ -318,6 +320,12 @@ run_one() {
   fi
   if [[ "${NO_REFRESH_CONTEXT_EACH_EPOCH}" == "1" ]]; then
     cmd+=(--no_refresh_context_each_epoch)
+  fi
+  if [[ "${META_ONLY_RETRIEVAL}" == "1" ]]; then
+    cmd+=(--meta_only_retrieval)
+  fi
+  if [[ "${COMPARE_RETRIEVAL_TOPM}" == "1" ]]; then
+    cmd+=(--compare_retrieval_topm)
   fi
 
   set +e

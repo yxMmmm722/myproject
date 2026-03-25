@@ -39,19 +39,24 @@ class Model(nn.Module):
             use_gated_aggregation=getattr(configs, "use_gated_aggregation", True),
             learnable_alpha=getattr(configs, "learnable_alpha", False),
             train_context_encoder=not getattr(configs, "freeze_context_encoder", False),
+            meta_only_retrieval=getattr(configs, "meta_only_retrieval", False),
+            compare_retrieval_topk=getattr(
+                configs,
+                "compare_retrieval_topm",
+                getattr(configs, "compare_retrieval_topk", False),
+            ),
         )
 
         self.period_num = self.rt.period_num[-1 * self.n_period:]
         self.retrieval_pred = nn.ModuleList(
             [nn.Linear(self.pred_len // g, self.pred_len) for g in self.period_num]
         )
-        self.period_router_hidden_dim = getattr(configs, "period_router_hidden_dim", 128)
-        self.period_router_input_dim = self.pred_len + len(self.period_num) * 4
-        self.period_router = nn.Sequential(
-            nn.Linear(self.period_router_input_dim, self.period_router_hidden_dim),
-            nn.GELU(),
-            nn.Linear(self.period_router_hidden_dim, len(self.period_num)),
-        )
+        self.period_attn_dim = getattr(configs, "period_router_hidden_dim", 128)
+        self.period_query_proj = nn.Linear(self.pred_len, self.period_attn_dim)
+        self.period_key_proj = nn.Linear(self.pred_len, self.period_attn_dim)
+        self.period_meta_proj = nn.Linear(4, self.period_attn_dim)
+        self.period_attn_dropout = nn.Dropout(getattr(configs, "period_attn_dropout", 0.0))
+        self.period_attn_scale = self.period_attn_dim ** -0.5
         self.text_encoder = None
         self.text_proj = None
         self.text_feature_dict = {}
@@ -175,6 +180,23 @@ class Model(nn.Module):
         refresh_device = self._resolve_cache_device(self.retrieval_cache_device)
         self.rt.refresh_context_pool(device=refresh_device)
 
+    def reset_retrieval_compare_stats(self):
+        if not self.online_retrieval:
+            return
+        if not hasattr(self, "rt"):
+            return
+        if hasattr(self.rt, "reset_retrieval_compare_stats"):
+            self.rt.reset_retrieval_compare_stats()
+
+    def get_retrieval_compare_stats(self):
+        if not self.online_retrieval:
+            return None
+        if not hasattr(self, "rt"):
+            return None
+        if hasattr(self.rt, "get_retrieval_compare_stats"):
+            return self.rt.get_retrieval_compare_stats()
+        return None
+
     def _get_text_feature(self, index, mode, bsz, meta_text=None):
         return torch.zeros((bsz, 0), device=self.device)
 
@@ -185,11 +207,11 @@ class Model(nn.Module):
         gsz = len(self.period_num)
         out = torch.zeros((bsz, gsz, 4), device=device)
         if not isinstance(meta_data, dict):
-            return out.reshape(bsz, -1)
+            return out
 
         local_state = meta_data.get("local_state_by_period", None)
         if local_state is None:
-            return out.reshape(bsz, -1)
+            return out
 
         if torch.is_tensor(local_state):
             local_state = local_state.float()
@@ -213,7 +235,7 @@ class Model(nn.Module):
             local_state = torch.cat([local_state, pad], dim=2)
 
         local_state = local_state[:, :gsz, :4].to(device)
-        return local_state.reshape(bsz, -1)
+        return local_state
 
     def encoder(self, x, index, mode, meta_data=None, meta_text=None, meta_text_by_period=None):
         bsz, seq_len, channels = x.shape
@@ -257,10 +279,17 @@ class Model(nn.Module):
 
         pred_stack = torch.stack(retrieval_pred_list, dim=1)  # B, G, P, C
         query_signal = x_pred_from_x.mean(dim=2)  # B, P
-        local_state_feature = self._extract_local_state_feature(meta_data, bsz, x.device)  # B, 4G
-        router_input = torch.cat([query_signal, local_state_feature], dim=1)  # B, P + 4G
-        period_logits = self.period_router(router_input)  # B, G
+        query_token = self.period_query_proj(query_signal).unsqueeze(1)  # B, 1, D
+
+        period_signal = pred_stack.mean(dim=3)  # B, G, P
+        key_token = self.period_key_proj(period_signal)  # B, G, D
+        local_state_feature = self._extract_local_state_feature(meta_data, bsz, x.device)  # B, G, 4
+        key_token = key_token + self.period_meta_proj(local_state_feature)  # B, G, D
+
+        period_logits = torch.matmul(query_token, key_token.transpose(1, 2)).squeeze(1) * self.period_attn_scale  # B, G
         period_weight = torch.softmax(period_logits, dim=1)
+        period_weight = self.period_attn_dropout(period_weight)
+        period_weight = period_weight / period_weight.sum(dim=1, keepdim=True).clamp_min(1e-6)
         pred = (pred_stack * period_weight.unsqueeze(-1).unsqueeze(-1)).sum(dim=1)  # B, P, C
         pred = pred + x_offset
         return pred

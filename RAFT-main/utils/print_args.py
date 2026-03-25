@@ -40,6 +40,12 @@ def print_args(args):
     print(f'  {"Output Attention:":<20}{args.output_attention:<20}')
     if hasattr(args, "retrieval_alpha"):
         print(f'  {"Retr Alpha:":<20}{args.retrieval_alpha:<20}{"Coarse K:":<20}{args.retrieval_coarse_k:<20}')
+    if hasattr(args, "meta_only_retrieval"):
+        print(f'  {"Meta-Only Retr:":<20}{args.meta_only_retrieval:<20}{"Topm:":<20}{args.topm:<20}')
+    if hasattr(args, "compare_retrieval_topm"):
+        print(f'  {"Cmp Retr Topm:":<20}{args.compare_retrieval_topm:<20}')
+    elif hasattr(args, "compare_retrieval_topk"):
+        print(f'  {"Cmp Retr Topm:":<20}{args.compare_retrieval_topk:<20}')
     if hasattr(args, "context_dim"):
         print(f'  {"Context Dim:":<20}{args.context_dim:<20}{"Learnable Alpha:":<20}{args.learnable_alpha:<20}')
     if hasattr(args, "freeze_context_encoder"):

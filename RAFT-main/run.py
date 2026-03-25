@@ -143,6 +143,11 @@ if __name__ == '__main__':
                         help='compute retrieval online instead of using precomputed cache')
     parser.add_argument('--retrieval_coarse_k', type=int, default=80,
                         help='coarse retrieval top-k using waveform similarity')
+    parser.add_argument('--meta_only_retrieval', action='store_true',
+                        help='use one-shot meta-context retrieval only (disable two-stage retrieval)')
+    parser.add_argument('--compare_retrieval_topm', action='store_true',
+                        help='compare top-m overlap between waveform-only retrieval and meta-only retrieval')
+    parser.add_argument('--compare_retrieval_topk', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--context_dim', type=int, default=64,
                         help='context encoder hidden dimension')
     parser.add_argument('--gate_hidden_dim', type=int, default=128,
@@ -229,6 +234,8 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     apply_data_preset(args)
+    args.compare_retrieval_topk = bool(args.compare_retrieval_topm or args.compare_retrieval_topk)
+    args.compare_retrieval_topm = args.compare_retrieval_topk
     args.refresh_context_each_epoch = not args.no_refresh_context_each_epoch
     args.use_gated_aggregation = not args.no_gated_aggregation
     # args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
