@@ -24,6 +24,8 @@ SAVE_RETRIEVAL_CASES="${SAVE_RETRIEVAL_CASES:-0}"  # 1: save one test case panel
 RETRIEVAL_CASE_PERIOD_IDX="${RETRIEVAL_CASE_PERIOD_IDX:--1}"  # -1 means last period scale
 RETRIEVAL_CASE_CHANNEL_IDX="${RETRIEVAL_CASE_CHANNEL_IDX:--1}"  # -1 means last channel
 RETRIEVAL_CASE_SAMPLE_IDX="${RETRIEVAL_CASE_SAMPLE_IDX:-0}"  # sample index in first test batch
+RETRIEVAL_CASE_NUM_SAMPLES="${RETRIEVAL_CASE_NUM_SAMPLES:-1}"  # number of samples in first test batch to visualize
+RETRIEVAL_CASE_ALL_PERIODS="${RETRIEVAL_CASE_ALL_PERIODS:-0}"  # 1: visualize all period scales
 BATCH_SIZE="${BATCH_SIZE:-32}"
 TRAIN_EPOCHS="${TRAIN_EPOCHS:-10}"
 LEARNING_RATE="${LEARNING_RATE:-0.0001}"
@@ -287,7 +289,7 @@ run_one() {
 
   echo "============================================================"
   echo "[RUN ] dataset=${dataset} pred_len=${pred_len} channels=${channels}"
-  echo "[CFG ] seq_len=${seq_len} lr=${learning_rate} lradj=${LRADJ} topm=${topm} meta_only=${META_ONLY_RETRIEVAL} cmp_topm=${COMPARE_RETRIEVAL_TOPM}:${topm} save_case=${SAVE_RETRIEVAL_CASES} preset=${preset_source} cache=${retrieval_cache_device_run}/${text_cache_device_run}"
+  echo "[CFG ] seq_len=${seq_len} lr=${learning_rate} lradj=${LRADJ} topm=${topm} meta_only=${META_ONLY_RETRIEVAL} cmp_topm=${COMPARE_RETRIEVAL_TOPM}:${topm} save_case=${SAVE_RETRIEVAL_CASES} case_n=${RETRIEVAL_CASE_NUM_SAMPLES} case_all_p=${RETRIEVAL_CASE_ALL_PERIODS} preset=${preset_source} cache=${retrieval_cache_device_run}/${text_cache_device_run}"
   echo "[LOG ] ${log_file}"
   echo "============================================================"
 
@@ -336,6 +338,10 @@ run_one() {
     cmd+=(--retrieval_case_period_idx "${RETRIEVAL_CASE_PERIOD_IDX}")
     cmd+=(--retrieval_case_channel_idx "${RETRIEVAL_CASE_CHANNEL_IDX}")
     cmd+=(--retrieval_case_sample_idx "${RETRIEVAL_CASE_SAMPLE_IDX}")
+    cmd+=(--retrieval_case_num_samples "${RETRIEVAL_CASE_NUM_SAMPLES}")
+    if [[ "${RETRIEVAL_CASE_ALL_PERIODS}" == "1" ]]; then
+      cmd+=(--retrieval_case_all_periods)
+    fi
   fi
 
   set +e

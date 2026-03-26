@@ -63,6 +63,8 @@ def print_args(args):
     if hasattr(args, "save_retrieval_cases"):
         print(f'  {"Save Retr Cases:":<20}{args.save_retrieval_cases:<20}{"Case Period Idx:":<20}{args.retrieval_case_period_idx:<20}')
         print(f'  {"Case Channel Idx:":<20}{args.retrieval_case_channel_idx:<20}{"Case Sample Idx:":<20}{args.retrieval_case_sample_idx:<20}')
+        if hasattr(args, "retrieval_case_num_samples"):
+            print(f'  {"Case #Samples:":<20}{args.retrieval_case_num_samples:<20}{"All Periods:":<20}{args.retrieval_case_all_periods:<20}')
     print()
 
     print("\033[1m" + "Run Parameters" + "\033[0m")

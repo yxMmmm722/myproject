@@ -188,6 +188,10 @@ if __name__ == '__main__':
                         help='which channel index to visualize, -1 means last channel')
     parser.add_argument('--retrieval_case_sample_idx', type=int, default=0,
                         help='which sample in batch to visualize')
+    parser.add_argument('--retrieval_case_num_samples', type=int, default=1,
+                        help='how many samples from first test batch to visualize')
+    parser.add_argument('--retrieval_case_all_periods', action='store_true',
+                        help='visualize all period scales for selected samples')
 
     # optimization
     parser.add_argument('--num_workers', type=int, default=10, help='data loader num workers')

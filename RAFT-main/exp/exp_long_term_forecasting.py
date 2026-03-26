@@ -119,7 +119,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         try:
             import matplotlib.pyplot as plt
 
-            fig, axes = plt.subplots(2, 2, figsize=(14, 8))
+            # Share x/y within each row to guarantee aligned axis ranges.
+            fig, axes = plt.subplots(2, 2, figsize=(14, 8), sharex='row', sharey='row')
             fig.suptitle(
                 f"Wave vs Meta Top-m Case | period_g={meta_info['period_g']} channel={meta_info['channel_idx']} topm={meta_info['topm']}",
                 fontsize=12,
@@ -466,8 +467,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         self.model.eval()
         amp_enabled = self.args.use_amp and self.args.use_gpu
         cmp_stats_test = None
-        case_saved = False
-        case_data_pending = None
+        case_export_done = False
+        case_data_pending = []
         with torch.no_grad():
             raft_model = None
             if self.args.model == 'RAFT':
@@ -484,45 +485,66 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
                 if (
                     self.args.model == 'RAFT'
-                    and (not case_saved)
-                    and case_data_pending is None
+                    and (not case_export_done)
+                    and len(case_data_pending) == 0
                     and getattr(self.args, "save_retrieval_cases", False)
                     and raft_model is not None
                     and hasattr(raft_model, "export_wave_meta_topm_case")
                 ):
-                    case_data = raft_model.export_wave_meta_topm_case(
-                        x=batch_x,
-                        index=index,
-                        meta_data=meta_data,
-                        sample_idx=getattr(self.args, "retrieval_case_sample_idx", 0),
-                        period_idx=getattr(self.args, "retrieval_case_period_idx", -1),
-                        channel_idx=getattr(self.args, "retrieval_case_channel_idx", -1),
-                        train=False,
-                    )
-                    if case_data is not None:
-                        sample_idx = int(getattr(self.args, "retrieval_case_sample_idx", 0))
-                        sample_idx = max(0, min(sample_idx, batch_x.shape[0] - 1))
-                        channel_idx = int(case_data.get("channel_idx", -1))
-                        period_idx = int(case_data.get("period_idx", -1))
-                        batch_y_future = batch_y[:, -self.args.pred_len:, :]
-                        true_future = None
-                        if (
-                            hasattr(raft_model, "rt")
-                            and hasattr(raft_model.rt, "decompose_mg")
-                            and 0 <= period_idx < len(getattr(raft_model.rt, "period_num", []))
-                            and 0 <= channel_idx < batch_y_future.shape[-1]
-                        ):
-                            y_mg, _ = raft_model.rt.decompose_mg(batch_y_future)
-                            true_future = y_mg[period_idx, sample_idx, :, channel_idx].detach().cpu().numpy()
-                        elif 0 <= channel_idx < batch_y_future.shape[-1]:
-                            true_future = batch_y_future[sample_idx, :, channel_idx].detach().cpu().numpy()
+                    rt = getattr(raft_model, "rt", None)
+                    period_idx_cfg = int(getattr(self.args, "retrieval_case_period_idx", -1))
+                    if bool(getattr(self.args, "retrieval_case_all_periods", False)) and rt is not None and hasattr(rt, "period_num"):
+                        period_indices = list(range(len(rt.period_num)))
+                    else:
+                        period_indices = [period_idx_cfg]
 
-                        if true_future is not None:
-                            case_data["true_future"] = true_future
-                        case_data_pending = {
-                            "case_data": case_data,
-                            "sample_idx": sample_idx,
-                        }
+                    num_samples = int(getattr(self.args, "retrieval_case_num_samples", 1))
+                    num_samples = max(1, num_samples)
+                    start_sample_idx = int(getattr(self.args, "retrieval_case_sample_idx", 0))
+                    start_sample_idx = max(0, min(start_sample_idx, batch_x.shape[0] - 1))
+                    end_sample_idx = min(start_sample_idx + num_samples, batch_x.shape[0])
+                    sample_indices = list(range(start_sample_idx, end_sample_idx))
+                    channel_idx_cfg = int(getattr(self.args, "retrieval_case_channel_idx", -1))
+
+                    batch_y_future = batch_y[:, -self.args.pred_len:, :]
+                    y_mg_all = None
+                    if rt is not None and hasattr(rt, "decompose_mg"):
+                        y_mg_all, _ = rt.decompose_mg(batch_y_future)
+
+                    for sample_idx in sample_indices:
+                        for period_idx in period_indices:
+                            case_data = raft_model.export_wave_meta_topm_case(
+                                x=batch_x,
+                                index=index,
+                                meta_data=meta_data,
+                                sample_idx=sample_idx,
+                                period_idx=period_idx,
+                                channel_idx=channel_idx_cfg,
+                                train=False,
+                            )
+                            if case_data is None:
+                                continue
+
+                            channel_idx = int(case_data.get("channel_idx", -1))
+                            period_idx_resolved = int(case_data.get("period_idx", -1))
+                            true_future = None
+                            if (
+                                y_mg_all is not None
+                                and 0 <= period_idx_resolved < y_mg_all.shape[0]
+                                and 0 <= channel_idx < batch_y_future.shape[-1]
+                            ):
+                                true_future = y_mg_all[period_idx_resolved, sample_idx, :, channel_idx].detach().cpu().numpy()
+                            elif 0 <= channel_idx < batch_y_future.shape[-1]:
+                                true_future = batch_y_future[sample_idx, :, channel_idx].detach().cpu().numpy()
+
+                            if true_future is not None:
+                                case_data["true_future"] = true_future
+                            case_data_pending.append(
+                                {
+                                    "case_data": case_data,
+                                    "sample_idx": sample_idx,
+                                }
+                            )
 
                 # decoder input
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
@@ -552,17 +574,13 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
                 if (
                     self.args.model == 'RAFT'
-                    and (not case_saved)
-                    and case_data_pending is not None
+                    and (not case_export_done)
+                    and len(case_data_pending) > 0
                     and raft_model is not None
                 ):
-                    case_data = case_data_pending["case_data"]
-                    sample_idx = int(case_data_pending["sample_idx"])
-                    channel_idx = int(case_data.get("channel_idx", -1))
-                    period_idx = int(case_data.get("period_idx", -1))
                     rt = getattr(raft_model, "rt", None)
 
-                    def _extract_future_curve(pred_tensor):
+                    def _extract_future_curve(pred_tensor, sample_idx, period_idx, channel_idx):
                         pred_tensor = pred_tensor[:, -self.args.pred_len:, :]
                         if (
                             rt is not None
@@ -576,10 +594,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                             return pred_tensor[sample_idx, :, channel_idx].detach().cpu().numpy()
                         return None
 
-                    # Current run-mode prediction (for backward compatibility).
-                    pred_future = _extract_future_curve(outputs)
-                    if pred_future is not None:
-                        case_data["pred_future"] = pred_future
+                    wave_outputs = None
+                    meta_outputs = None
 
                     # Explicitly compare wave-only retrieval prediction vs meta-only retrieval prediction.
                     if rt is not None and hasattr(rt, "meta_only_retrieval"):
@@ -605,9 +621,6 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                                     mode='test',
                                     meta_data=meta_data,
                                 )
-                            wave_pred_future = _extract_future_curve(wave_outputs)
-                            if wave_pred_future is not None:
-                                case_data["wave_pred_future"] = wave_pred_future
 
                             rt.meta_only_retrieval = True
                             if self.args.use_amp:
@@ -625,21 +638,41 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                                     mode='test',
                                     meta_data=meta_data,
                                 )
-                            meta_pred_future = _extract_future_curve(meta_outputs)
-                            if meta_pred_future is not None:
-                                case_data["meta_pred_future"] = meta_pred_future
                         finally:
                             rt.meta_only_retrieval = orig_meta_only
                             if hasattr(rt, "compare_retrieval_topk"):
                                 rt.compare_retrieval_topk = orig_compare
 
-                    self._save_retrieval_case_viz(
-                        case_data=case_data,
-                        out_dir=os.path.join(folder_path, "retrieval_cases"),
-                        tag="test_case_0",
-                    )
-                    case_saved = True
-                    case_data_pending = None
+                    for case_entry in case_data_pending:
+                        case_data = case_entry["case_data"]
+                        sample_idx = int(case_entry["sample_idx"])
+                        channel_idx = int(case_data.get("channel_idx", -1))
+                        period_idx = int(case_data.get("period_idx", -1))
+                        period_g = int(case_data.get("period_g", -1))
+
+                        pred_future = _extract_future_curve(outputs, sample_idx, period_idx, channel_idx)
+                        if pred_future is not None:
+                            case_data["pred_future"] = pred_future
+
+                        if wave_outputs is not None:
+                            wave_pred_future = _extract_future_curve(wave_outputs, sample_idx, period_idx, channel_idx)
+                            if wave_pred_future is not None:
+                                case_data["wave_pred_future"] = wave_pred_future
+
+                        if meta_outputs is not None:
+                            meta_pred_future = _extract_future_curve(meta_outputs, sample_idx, period_idx, channel_idx)
+                            if meta_pred_future is not None:
+                                case_data["meta_pred_future"] = meta_pred_future
+
+                        tag = f"test_case_s{sample_idx}_p{period_idx}_g{period_g}_c{channel_idx}"
+                        self._save_retrieval_case_viz(
+                            case_data=case_data,
+                            out_dir=os.path.join(folder_path, "retrieval_cases"),
+                            tag=tag,
+                        )
+
+                    case_export_done = True
+                    case_data_pending = []
 
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, :]
