@@ -87,6 +87,9 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         wave_fut = np.asarray(case_data.get("wave_futures", []), dtype=np.float32)
         meta_fut = np.asarray(case_data.get("meta_futures", []), dtype=np.float32)
         true_fut = np.asarray(case_data.get("true_future", []), dtype=np.float32)
+        pred_fut = np.asarray(case_data.get("pred_future", []), dtype=np.float32)
+        wave_pred_fut = np.asarray(case_data.get("wave_pred_future", []), dtype=np.float32)
+        meta_pred_fut = np.asarray(case_data.get("meta_pred_future", []), dtype=np.float32)
 
         np.save(os.path.join(out_dir, f"{tag}_query_history.npy"), query_history)
         np.save(os.path.join(out_dir, f"{tag}_wave_histories.npy"), wave_hist)
@@ -95,6 +98,12 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         np.save(os.path.join(out_dir, f"{tag}_meta_futures.npy"), meta_fut)
         if true_fut.size > 0:
             np.save(os.path.join(out_dir, f"{tag}_true_future.npy"), true_fut)
+        if pred_fut.size > 0:
+            np.save(os.path.join(out_dir, f"{tag}_pred_future.npy"), pred_fut)
+        if wave_pred_fut.size > 0:
+            np.save(os.path.join(out_dir, f"{tag}_wave_pred_future.npy"), wave_pred_fut)
+        if meta_pred_fut.size > 0:
+            np.save(os.path.join(out_dir, f"{tag}_meta_pred_future.npy"), meta_pred_fut)
 
         meta_info = {
             "period_idx": int(case_data.get("period_idx", -1)),
@@ -135,6 +144,12 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             ax = axes[1, 0]
             if true_fut.size > 0:
                 ax.plot(true_fut, color="black", linewidth=2.0, label="true future")
+            if wave_pred_fut.size > 0:
+                ax.plot(wave_pred_fut, color="#2563eb", linewidth=1.8, label="wave pred")
+            if meta_pred_fut.size > 0:
+                ax.plot(meta_pred_fut, color="#dc2626", linewidth=1.8, label="meta pred")
+            elif pred_fut.size > 0:
+                ax.plot(pred_fut, color="#dc2626", linewidth=1.8, label="pred future")
             for i in range(wave_fut.shape[0]):
                 ax.plot(wave_fut[i], alpha=0.35, linewidth=1.0)
             ax.set_title("Wave Top-m Futures")
@@ -143,10 +158,87 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             ax = axes[1, 1]
             if true_fut.size > 0:
                 ax.plot(true_fut, color="black", linewidth=2.0, label="true future")
+            if wave_pred_fut.size > 0:
+                ax.plot(wave_pred_fut, color="#2563eb", linewidth=1.8, label="wave pred")
+            if meta_pred_fut.size > 0:
+                ax.plot(meta_pred_fut, color="#dc2626", linewidth=1.8, label="meta pred")
+            elif pred_fut.size > 0:
+                ax.plot(pred_fut, color="#dc2626", linewidth=1.8, label="pred future")
             for i in range(meta_fut.shape[0]):
                 ax.plot(meta_fut[i], alpha=0.35, linewidth=1.0)
             ax.set_title("Meta Top-m Futures")
             ax.legend(loc="best")
+
+            # Unify axis ranges/ticks across left-right panels (histories and futures).
+            def _collect_series(*arrs):
+                out = []
+                for a in arrs:
+                    arr = np.asarray(a, dtype=np.float32)
+                    if arr.size == 0:
+                        continue
+                    if arr.ndim == 1:
+                        out.append(arr)
+                    else:
+                        out.extend([arr[i] for i in range(arr.shape[0])])
+                return out
+
+            hist_series = _collect_series(query_history, wave_hist, meta_hist)
+            fut_series = _collect_series(true_fut, wave_fut, meta_fut, pred_fut, wave_pred_fut, meta_pred_fut)
+
+            def _limits(series_list):
+                if len(series_list) == 0:
+                    return -1.0, 1.0
+                mn = min(float(np.min(s)) for s in series_list)
+                mx = max(float(np.max(s)) for s in series_list)
+                if not np.isfinite(mn) or not np.isfinite(mx):
+                    return -1.0, 1.0
+                if abs(mx - mn) < 1e-8:
+                    pad = max(abs(mx), 1.0) * 0.1 + 1e-3
+                    return mn - pad, mx + pad
+                pad = 0.05 * (mx - mn)
+                return mn - pad, mx + pad
+
+            hist_ymin, hist_ymax = _limits(hist_series)
+            fut_ymin, fut_ymax = _limits(fut_series)
+
+            if query_history.ndim == 1 and query_history.size > 0:
+                hist_len = int(query_history.shape[0])
+            elif wave_hist.ndim == 2 and wave_hist.size > 0:
+                hist_len = int(wave_hist.shape[1])
+            elif meta_hist.ndim == 2 and meta_hist.size > 0:
+                hist_len = int(meta_hist.shape[1])
+            else:
+                hist_len = 720
+
+            if true_fut.ndim == 1 and true_fut.size > 0:
+                fut_len = int(true_fut.shape[0])
+            elif wave_fut.ndim == 2 and wave_fut.size > 0:
+                fut_len = int(wave_fut.shape[1])
+            elif meta_fut.ndim == 2 and meta_fut.size > 0:
+                fut_len = int(meta_fut.shape[1])
+            elif wave_pred_fut.ndim == 1 and wave_pred_fut.size > 0:
+                fut_len = int(wave_pred_fut.shape[0])
+            elif meta_pred_fut.ndim == 1 and meta_pred_fut.size > 0:
+                fut_len = int(meta_pred_fut.shape[0])
+            elif pred_fut.ndim == 1 and pred_fut.size > 0:
+                fut_len = int(pred_fut.shape[0])
+            else:
+                fut_len = 96
+            hist_xticks = np.linspace(0, max(hist_len - 1, 1), 7, dtype=int)
+            fut_xticks = np.linspace(0, max(fut_len - 1, 1), 7, dtype=int)
+            hist_yticks = np.linspace(hist_ymin, hist_ymax, 7)
+            fut_yticks = np.linspace(fut_ymin, fut_ymax, 7)
+
+            for ax in [axes[0, 0], axes[0, 1]]:
+                ax.set_xlim(0, max(hist_len - 1, 1))
+                ax.set_ylim(hist_ymin, hist_ymax)
+                ax.set_xticks(hist_xticks)
+                ax.set_yticks(hist_yticks)
+            for ax in [axes[1, 0], axes[1, 1]]:
+                ax.set_xlim(0, max(fut_len - 1, 1))
+                ax.set_ylim(fut_ymin, fut_ymax)
+                ax.set_xticks(fut_xticks)
+                ax.set_yticks(fut_yticks)
 
             for ax in axes.reshape(-1):
                 ax.grid(alpha=0.2)
@@ -375,6 +467,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         amp_enabled = self.args.use_amp and self.args.use_gpu
         cmp_stats_test = None
         case_saved = False
+        case_data_pending = None
         with torch.no_grad():
             raft_model = None
             if self.args.model == 'RAFT':
@@ -392,6 +485,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 if (
                     self.args.model == 'RAFT'
                     and (not case_saved)
+                    and case_data_pending is None
                     and getattr(self.args, "save_retrieval_cases", False)
                     and raft_model is not None
                     and hasattr(raft_model, "export_wave_meta_topm_case")
@@ -425,12 +519,10 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
                         if true_future is not None:
                             case_data["true_future"] = true_future
-                        self._save_retrieval_case_viz(
-                            case_data=case_data,
-                            out_dir=os.path.join(folder_path, "retrieval_cases"),
-                            tag="test_case_0",
-                        )
-                        case_saved = True
+                        case_data_pending = {
+                            "case_data": case_data,
+                            "sample_idx": sample_idx,
+                        }
 
                 # decoder input
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
@@ -457,6 +549,97 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                         )
                     else:
                         outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+
+                if (
+                    self.args.model == 'RAFT'
+                    and (not case_saved)
+                    and case_data_pending is not None
+                    and raft_model is not None
+                ):
+                    case_data = case_data_pending["case_data"]
+                    sample_idx = int(case_data_pending["sample_idx"])
+                    channel_idx = int(case_data.get("channel_idx", -1))
+                    period_idx = int(case_data.get("period_idx", -1))
+                    rt = getattr(raft_model, "rt", None)
+
+                    def _extract_future_curve(pred_tensor):
+                        pred_tensor = pred_tensor[:, -self.args.pred_len:, :]
+                        if (
+                            rt is not None
+                            and hasattr(rt, "decompose_mg")
+                            and 0 <= period_idx < len(getattr(rt, "period_num", []))
+                            and 0 <= channel_idx < pred_tensor.shape[-1]
+                        ):
+                            pred_mg, _ = rt.decompose_mg(pred_tensor)
+                            return pred_mg[period_idx, sample_idx, :, channel_idx].detach().cpu().numpy()
+                        if 0 <= channel_idx < pred_tensor.shape[-1]:
+                            return pred_tensor[sample_idx, :, channel_idx].detach().cpu().numpy()
+                        return None
+
+                    # Current run-mode prediction (for backward compatibility).
+                    pred_future = _extract_future_curve(outputs)
+                    if pred_future is not None:
+                        case_data["pred_future"] = pred_future
+
+                    # Explicitly compare wave-only retrieval prediction vs meta-only retrieval prediction.
+                    if rt is not None and hasattr(rt, "meta_only_retrieval"):
+                        orig_meta_only = bool(rt.meta_only_retrieval)
+                        orig_compare = bool(getattr(rt, "compare_retrieval_topk", False))
+                        try:
+                            if hasattr(rt, "compare_retrieval_topk"):
+                                rt.compare_retrieval_topk = False
+
+                            rt.meta_only_retrieval = False
+                            if self.args.use_amp:
+                                with torch.cuda.amp.autocast(enabled=amp_enabled):
+                                    wave_outputs = self.model(
+                                        batch_x,
+                                        index,
+                                        mode='test',
+                                        meta_data=meta_data,
+                                    )
+                            else:
+                                wave_outputs = self.model(
+                                    batch_x,
+                                    index,
+                                    mode='test',
+                                    meta_data=meta_data,
+                                )
+                            wave_pred_future = _extract_future_curve(wave_outputs)
+                            if wave_pred_future is not None:
+                                case_data["wave_pred_future"] = wave_pred_future
+
+                            rt.meta_only_retrieval = True
+                            if self.args.use_amp:
+                                with torch.cuda.amp.autocast(enabled=amp_enabled):
+                                    meta_outputs = self.model(
+                                        batch_x,
+                                        index,
+                                        mode='test',
+                                        meta_data=meta_data,
+                                    )
+                            else:
+                                meta_outputs = self.model(
+                                    batch_x,
+                                    index,
+                                    mode='test',
+                                    meta_data=meta_data,
+                                )
+                            meta_pred_future = _extract_future_curve(meta_outputs)
+                            if meta_pred_future is not None:
+                                case_data["meta_pred_future"] = meta_pred_future
+                        finally:
+                            rt.meta_only_retrieval = orig_meta_only
+                            if hasattr(rt, "compare_retrieval_topk"):
+                                rt.compare_retrieval_topk = orig_compare
+
+                    self._save_retrieval_case_viz(
+                        case_data=case_data,
+                        out_dir=os.path.join(folder_path, "retrieval_cases"),
+                        tag="test_case_0",
+                    )
+                    case_saved = True
+                    case_data_pending = None
 
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, :]
