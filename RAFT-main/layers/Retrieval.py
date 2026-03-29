@@ -781,6 +781,8 @@ class RetrievalTool(nn.Module):
         }
 
     def retrieve(self, x, index, meta_query=None, train=True):
+        bsz, seq_len, channels = x.shape
+        assert seq_len == self.seq_len and channels == self.channels
         index = index.to(x.device)
 
         require_grad = train and self.train_context_encoder and torch.is_grad_enabled()

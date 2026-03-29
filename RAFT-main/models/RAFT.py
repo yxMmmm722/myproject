@@ -31,7 +31,6 @@ class Model(nn.Module):
             pred_len=self.pred_len,
             channels=self.channels,
             n_period=self.n_period,
-            temperature=getattr(configs, "retrieval_temperature", 0.1),
             topm=self.topm,
             alpha=getattr(configs, "retrieval_alpha", 0.7),
             coarse_k=getattr(configs, "retrieval_coarse_k", 80),
@@ -62,24 +61,8 @@ class Model(nn.Module):
         self.text_proj = None
         self.text_feature_dict = {}
         self.text_feature_by_period_dict = {}
+        # One-shot base/retrieval fusion after cross-scale retrieval aggregation.
         self.linear_pred = nn.Linear(2 * self.pred_len, self.pred_len)
-        self.retrieval_conf_gate = nn.ModuleList(
-            [nn.Linear(3 * self.pred_len, self.pred_len) for _ in self.period_num]
-        )
-        self.retrieval_residual_fuse = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.Linear(3 * self.pred_len, 2 * self.pred_len),
-                    nn.GELU(),
-                    nn.Dropout(getattr(configs, "dropout", 0.1)),
-                    nn.Linear(2 * self.pred_len, self.pred_len),
-                )
-                for _ in self.period_num
-            ]
-        )
-        self.retrieval_fuse_norm = nn.ModuleList(
-            [nn.LayerNorm(self.pred_len) for _ in self.period_num]
-        )
         self.linear_pred_per_period = nn.ModuleList(
             [nn.Linear(self.pred_len, self.pred_len) for _ in self.period_num]
         )
@@ -306,18 +289,7 @@ class Model(nn.Module):
             pr = pr.reshape(bsz, self.pred_len, self.channels)  # B, P, C
 
             retrieval_feature = pr.permute(0, 2, 1)  # B, C, P
-            diff_feature = retrieval_feature - numeric_feature
-            fusion_input = torch.cat([numeric_feature, retrieval_feature, diff_feature], dim=2)  # B, C, 3P
-
-            # Confidence-aware retrieval fusion:
-            # 1) gate learns how much to trust retrieval per horizon
-            # 2) residual branch fixes systematic bias not captured by interpolation
-            trust_gate = torch.sigmoid(self.retrieval_conf_gate[i](fusion_input))
-            base_fused = numeric_feature + trust_gate * diff_feature
-            residual_fused = self.retrieval_residual_fuse[i](fusion_input)
-            fusion_feature = self.retrieval_fuse_norm[i](base_fused + residual_fused)
-
-            pred_i = self.linear_pred_per_period[i](fusion_feature).permute(0, 2, 1).reshape(
+            pred_i = self.linear_pred_per_period[i](retrieval_feature).permute(0, 2, 1).reshape(
                 bsz, self.pred_len, self.channels
             )
             retrieval_pred_list.append(pred_i)
@@ -335,7 +307,12 @@ class Model(nn.Module):
         period_weight = torch.softmax(period_logits, dim=1)
         period_weight = self.period_attn_dropout(period_weight)
         period_weight = period_weight / period_weight.sum(dim=1, keepdim=True).clamp_min(1e-6)
-        pred = (pred_stack * period_weight.unsqueeze(-1).unsqueeze(-1)).sum(dim=1)  # B, P, C
+        retrieval_agg = (pred_stack * period_weight.unsqueeze(-1).unsqueeze(-1)).sum(dim=1)  # B, P, C
+
+        # Fuse once: aggregated multi-scale retrieval + base prediction.
+        retrieval_feature = retrieval_agg.permute(0, 2, 1)  # B, C, P
+        fusion_feature = torch.cat([numeric_feature, retrieval_feature], dim=2)  # B, C, 2P
+        pred = self.linear_pred(fusion_feature).permute(0, 2, 1).reshape(bsz, self.pred_len, self.channels)
         pred = pred + x_offset
         return pred
 
