@@ -52,19 +52,17 @@ def print_args(args):
         print(f'  {"Freeze Context:":<20}{args.freeze_context_encoder:<20}{"Refresh Ctx Pool:":<20}{args.refresh_context_each_epoch:<20}')
     if hasattr(args, "online_retrieval"):
         print(f'  {"Online Retrieval:":<20}{args.online_retrieval:<20}')
-    if hasattr(args, "text_encoder_name"):
-        print(f'  {"Text Encoder:":<20}{args.text_encoder_name:<20}{"Text Proj Dim:":<20}{args.text_proj_dim:<20}')
-    if hasattr(args, "require_text_encoder"):
-        print(f'  {"Require Text Enc:":<20}{args.require_text_encoder:<20}')
-    if hasattr(args, "save_meta_texts"):
-        print(f'  {"Save Meta Texts:":<20}{args.save_meta_texts:<20}{"Text Dump Dir:":<20}{args.meta_text_dump_dir:<20}')
-    if hasattr(args, "meta_text_max_samples"):
-        print(f'  {"Dump Max Samples:":<20}{args.meta_text_max_samples:<20}')
     if hasattr(args, "save_retrieval_cases"):
         print(f'  {"Save Retr Cases:":<20}{args.save_retrieval_cases:<20}{"Case Period Idx:":<20}{args.retrieval_case_period_idx:<20}')
         print(f'  {"Case Channel Idx:":<20}{args.retrieval_case_channel_idx:<20}{"Case Sample Idx:":<20}{args.retrieval_case_sample_idx:<20}')
         if hasattr(args, "retrieval_case_num_samples"):
             print(f'  {"Case #Samples:":<20}{args.retrieval_case_num_samples:<20}{"All Periods:":<20}{args.retrieval_case_all_periods:<20}')
+        if hasattr(args, "retrieval_case_all_channels"):
+            print(f'  {"All Channels:":<20}{args.retrieval_case_all_channels:<20}')
+        if hasattr(args, "retrieval_case_first_last_samples"):
+            print(f'  {"First+Last Samp:":<20}{args.retrieval_case_first_last_samples:<20}')
+        if hasattr(args, "retrieval_case_first_last_batches"):
+            print(f'  {"First+Last Batch:":<20}{args.retrieval_case_first_last_batches:<20}')
     print()
 
     print("\033[1m" + "Run Parameters" + "\033[0m")

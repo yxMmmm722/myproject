@@ -1,5 +1,4 @@
 import argparse
-import os
 import torch
 from exp.exp_long_term_forecasting import Exp_Long_Term_Forecast
 from utils.print_args import print_args
@@ -9,7 +8,6 @@ import numpy as np
 DEFAULT_ROOT_PATH = './data/ETT/'
 DEFAULT_DATA_PATH = 'ETTh1.csv'
 DEFAULT_FREQ = 'h'
-DEFAULT_TEXT_ENCODER_PATH = './models/bert-base-uncased'
 
 DATA_PRESETS = {
     'ETTh1': {'root_path': './data/ETT/', 'data_path': 'ETTh1.csv', 'freq': 'h'},
@@ -137,6 +135,8 @@ if __name__ == '__main__':
     )
     parser.add_argument('--retrieval_alpha', type=float, default=0.7,
                         help='fused retrieval score weight for numerical similarity')
+    parser.add_argument('--retrieval_temperature', type=float, default=0.1,
+                        help='softmax temperature for retrieval candidate weighting')
     parser.add_argument('--learnable_alpha', action='store_true',
                         help='use learnable alpha for retrieval fusion')
     parser.add_argument('--online_retrieval', action='store_true',
@@ -164,22 +164,6 @@ if __name__ == '__main__':
                         help='hidden dim of meta context encoder')
     parser.add_argument('--meta_embed_dim', type=int, default=64,
                         help='output dim of meta context encoder')
-    parser.add_argument('--text_encoder_name', type=str, default=DEFAULT_TEXT_ENCODER_PATH,
-                        help='frozen text encoder name')
-    parser.add_argument('--require_text_encoder', action='store_true',
-                        help='raise error if transformer text encoder cannot be loaded')
-    parser.add_argument('--text_max_len', type=int, default=32,
-                        help='max token length for text encoder')
-    parser.add_argument('--text_proj_dim', type=int, default=64,
-                        help='projected text feature dim for multimodal fusion')
-    parser.add_argument('--text_batch_size', type=int, default=64,
-                        help='batch size for text encoding during cache building')
-    parser.add_argument('--save_meta_texts', action='store_true',
-                        help='dump generated meta-texts to disk for inspection')
-    parser.add_argument('--meta_text_dump_dir', type=str, default='./meta_text_dumps/',
-                        help='output directory for dumped meta-text files')
-    parser.add_argument('--meta_text_max_samples', type=int, default=200,
-                        help='max number of dumped text samples per split')
     parser.add_argument('--save_retrieval_cases', action='store_true',
                         help='save wave/meta top-m case plots in test stage')
     parser.add_argument('--retrieval_case_period_idx', type=int, default=-1,
@@ -192,6 +176,12 @@ if __name__ == '__main__':
                         help='how many samples from first test batch to visualize')
     parser.add_argument('--retrieval_case_all_periods', action='store_true',
                         help='visualize all period scales for selected samples')
+    parser.add_argument('--retrieval_case_all_channels', action='store_true',
+                        help='visualize all channels for selected samples/periods')
+    parser.add_argument('--retrieval_case_first_last_samples', action='store_true',
+                        help='visualize only first and last sample in the first test batch')
+    parser.add_argument('--retrieval_case_first_last_batches', action='store_true',
+                        help='visualize retrieval cases on first and last test batch')
 
     # optimization
     parser.add_argument('--num_workers', type=int, default=10, help='data loader num workers')
@@ -212,9 +202,6 @@ if __name__ == '__main__':
     parser.add_argument('--devices', type=str, default='0,1,2,3', help='device ids of multile gpus')
     parser.add_argument('--retrieval_cache_device', type=str, default='gpu', choices=['cpu', 'gpu'],
                         help='where to store precomputed retrieval cache')
-    parser.add_argument('--text_cache_device', type=str, default='gpu', choices=['cpu', 'gpu'],
-                        help='where to store precomputed text embedding cache')
-
     # de-stationary projector params
     parser.add_argument('--p_hidden_dims', type=int, nargs='+', default=[128, 128],
                         help='hidden layer dimensions of projector (List)')

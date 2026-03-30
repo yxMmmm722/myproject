@@ -48,40 +48,17 @@ def _safe_float_array(value):
     return arr
 
 
-def _safe_period_text_row(period_text, fallback_text):
-    if period_text is None:
-        return [fallback_text]
-    if isinstance(period_text, np.ndarray):
-        period_text = period_text.tolist()
-    if isinstance(period_text, (list, tuple)):
-        row = [str(x) for x in period_text]
-        return row if len(row) > 0 else [fallback_text]
-    return [str(period_text)]
-
-
 def hcar_collate_fn(batch):
-    text_mode = any(len(sample) >= 7 for sample in batch)
     norm_batch = []
     for sample in batch:
-        if text_mode and len(sample) >= 8:
-            norm_batch.append(sample[:8])
-        elif text_mode and len(sample) == 7:
-            norm_batch.append((*sample, None))
-        elif text_mode and len(sample) == 6:
-            norm_batch.append((*sample, "", None))
-        elif text_mode and len(sample) == 5:
-            norm_batch.append((*sample, {}, "", None))
-        elif (not text_mode) and len(sample) >= 6:
+        if len(sample) >= 6:
             norm_batch.append(sample[:6])
-        elif (not text_mode) and len(sample) == 5:
+        elif len(sample) == 5:
             norm_batch.append((*sample, {}))
         else:
             raise ValueError(f"Unexpected sample size in batch: {len(sample)}")
 
-    if text_mode:
-        index, seq_x, seq_y, seq_x_mark, seq_y_mark, meta_data, meta_text, meta_text_by_period = zip(*norm_batch)
-    else:
-        index, seq_x, seq_y, seq_x_mark, seq_y_mark, meta_data = zip(*norm_batch)
+    index, seq_x, seq_y, seq_x_mark, seq_y_mark, meta_data = zip(*norm_batch)
 
     index = torch.tensor(index, dtype=torch.long)
     seq_x = torch.from_numpy(np.stack([_safe_float_array(x) for x in seq_x], axis=0))
@@ -125,14 +102,6 @@ def hcar_collate_fn(batch):
 
     meta_batch = {k: torch.tensor(v, dtype=torch.long) for k, v in meta_batch.items()}
     meta_batch["local_state_by_period"] = torch.from_numpy(np.stack(local_state_batch, axis=0).astype(np.float32))
-
-    if text_mode:
-        meta_text = [str(t) for t in meta_text]
-        meta_text_by_period = [
-            _safe_period_text_row(pt, fallback_text=meta_text[i])
-            for i, pt in enumerate(meta_text_by_period)
-        ]
-        return index, seq_x, seq_y, seq_x_mark, seq_y_mark, meta_batch, meta_text, meta_text_by_period
 
     return index, seq_x, seq_y, seq_x_mark, seq_y_mark, meta_batch
 

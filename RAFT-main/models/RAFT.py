@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import numpy as np
 
 from layers.Retrieval import RetrievalTool
 
@@ -57,10 +56,6 @@ class Model(nn.Module):
         self.period_meta_proj = nn.Linear(4, self.period_attn_dim)
         self.period_attn_dropout = nn.Dropout(getattr(configs, "period_attn_dropout", 0.0))
         self.period_attn_scale = self.period_attn_dim ** -0.5
-        self.text_encoder = None
-        self.text_proj = None
-        self.text_feature_dict = {}
-        self.text_feature_by_period_dict = {}
         # One-shot base/retrieval fusion after cross-scale retrieval aggregation.
         self.linear_pred = nn.Linear(2 * self.pred_len, self.pred_len)
         self.linear_pred_per_period = nn.ModuleList(
@@ -71,79 +66,6 @@ class Model(nn.Module):
         if cache_mode == "gpu":
             return self.device
         return torch.device("cpu")
-
-    def _encode_texts(self, texts):
-        # Text branch is disabled; keep no-op for backward compatibility.
-        return torch.zeros((len(texts), 0))
-
-    def _collect_texts(self, dataset):
-        texts = []
-        texts_by_period = []
-        for i in range(len(dataset)):
-            item = dataset[i]
-            text = item[6] if len(item) > 6 else ""
-            text = str(text)
-            raw_period_text = item[7] if len(item) > 7 else None
-            if raw_period_text is None:
-                period_text = [text for _ in self.period_num]
-            else:
-                period_text = [str(x) for x in list(raw_period_text)]
-                if len(period_text) < len(self.period_num):
-                    period_text += [text for _ in range(len(self.period_num) - len(period_text))]
-                period_text = period_text[: len(self.period_num)]
-            texts.append(text)
-            texts_by_period.append(period_text)
-        return texts, texts_by_period
-
-    def _encode_texts_by_period(self, texts_by_period):
-        # Text branch is disabled; keep no-op for backward compatibility.
-        return torch.zeros((len(self.period_num), len(texts_by_period), 0))
-
-    def _normalize_period_text_batch(self, meta_text_by_period, bsz, fallback_text=None):
-        if meta_text_by_period is None:
-            if fallback_text is None:
-                fallback_text = ["" for _ in range(bsz)]
-            return [[str(fallback_text[b]) for _ in self.period_num] for b in range(bsz)]
-
-        data = meta_text_by_period
-        if torch.is_tensor(data):
-            data = data.tolist()
-        elif isinstance(data, np.ndarray):
-            data = data.tolist()
-
-        # Case-A: DataLoader default_collate on sample-level list[str]:
-        #   period-major shape: [G][B]
-        if isinstance(data, (list, tuple)) and len(data) == len(self.period_num):
-            first = data[0] if len(data) > 0 else []
-            if isinstance(first, (list, tuple)) and len(first) == bsz:
-                sample_major = []
-                for b in range(bsz):
-                    sample_major.append([str(data[g][b]) for g in range(len(self.period_num))])
-                return sample_major
-
-        # Case-B: sample-major shape: [B][G]
-        if isinstance(data, (list, tuple)) and len(data) == bsz:
-            out = []
-            for b in range(bsz):
-                row = data[b]
-                if isinstance(row, torch.Tensor):
-                    row = row.tolist()
-                if isinstance(row, np.ndarray):
-                    row = row.tolist()
-                if isinstance(row, (list, tuple)):
-                    row = [str(x) for x in row]
-                else:
-                    row = [str(row)]
-                if len(row) < len(self.period_num):
-                    fill = row[-1] if len(row) > 0 else (str(fallback_text[b]) if fallback_text is not None else "")
-                    row += [fill for _ in range(len(self.period_num) - len(row))]
-                row = row[: len(self.period_num)]
-                out.append(row)
-            return out
-
-        if fallback_text is None:
-            fallback_text = ["" for _ in range(bsz)]
-        return [[str(fallback_text[b]) for _ in self.period_num] for b in range(bsz)]
 
     def prepare_dataset(self, train_data, valid_data, test_data):
         self.retrieval_dict = {}
@@ -156,13 +78,13 @@ class Model(nn.Module):
             self.rt.prepare_dataset(train_data, cache_device=retrieval_cache_device)
 
             print("Doing Train Retrieval")
-            train_rt = self.rt.retrieve_all(train_data, train=True, device=self.device, return_texts=False)
+            train_rt = self.rt.retrieve_all(train_data, train=True, device=self.device)
 
             print("Doing Valid Retrieval")
-            valid_rt = self.rt.retrieve_all(valid_data, train=False, device=self.device, return_texts=False)
+            valid_rt = self.rt.retrieve_all(valid_data, train=False, device=self.device)
 
             print("Doing Test Retrieval")
-            test_rt = self.rt.retrieve_all(test_data, train=False, device=self.device, return_texts=False)
+            test_rt = self.rt.retrieve_all(test_data, train=False, device=self.device)
 
         if not self.online_retrieval:
             self.retrieval_dict["train"] = train_rt.detach().to(retrieval_cache_device)
@@ -215,12 +137,6 @@ class Model(nn.Module):
             train=train,
         )
 
-    def _get_text_feature(self, index, mode, bsz, meta_text=None):
-        return torch.zeros((bsz, 0), device=self.device)
-
-    def _get_text_feature_by_period(self, index, mode, bsz, meta_text=None, meta_text_by_period=None):
-        return torch.zeros((len(self.period_num), bsz, 0), device=self.device)
-
     def _extract_local_state_feature(self, meta_data, bsz, device):
         gsz = len(self.period_num)
         out = torch.zeros((bsz, gsz, 4), device=device)
@@ -255,7 +171,7 @@ class Model(nn.Module):
         local_state = local_state[:, :gsz, :4].to(device)
         return local_state
 
-    def encoder(self, x, index, mode, meta_data=None, meta_text=None, meta_text_by_period=None):
+    def encoder(self, x, index, mode, meta_data=None):
         bsz, seq_len, channels = x.shape
         assert seq_len == self.seq_len and channels == self.channels
 
@@ -295,19 +211,33 @@ class Model(nn.Module):
             retrieval_pred_list.append(pred_i)
 
         pred_stack = torch.stack(retrieval_pred_list, dim=1)  # B, G, P, C
-        query_signal = x_pred_from_x.mean(dim=2)  # B, P
-        query_token = self.period_query_proj(query_signal).unsqueeze(1)  # B, 1, D
 
-        period_signal = pred_stack.mean(dim=3)  # B, G, P
-        key_token = self.period_key_proj(period_signal)  # B, G, D
+        # Channel-wise period routing: one period distribution per sample-channel pair.
+        query_signal = x_pred_from_x.permute(0, 2, 1)  # B, C, P
+        query_token = self.period_query_proj(
+            query_signal.reshape(bsz * channels, self.pred_len)
+        ).reshape(bsz, channels, self.period_attn_dim)  # B, C, D
+
+        period_signal = pred_stack.permute(0, 3, 1, 2)  # B, C, G, P
+        gsz = len(self.period_num)
+        key_token = self.period_key_proj(
+            period_signal.reshape(bsz * channels * gsz, self.pred_len)
+        ).reshape(bsz, channels, gsz, self.period_attn_dim)  # B, C, G, D
+
         local_state_feature = self._extract_local_state_feature(meta_data, bsz, x.device)  # B, G, 4
-        key_token = key_token + self.period_meta_proj(local_state_feature)  # B, G, D
+        local_state_feature = local_state_feature.unsqueeze(1).expand(-1, channels, -1, -1)  # B, C, G, 4
+        key_token = key_token + self.period_meta_proj(
+            local_state_feature.reshape(bsz * channels * gsz, 4)
+        ).reshape(bsz, channels, gsz, self.period_attn_dim)  # B, C, G, D
 
-        period_logits = torch.matmul(query_token, key_token.transpose(1, 2)).squeeze(1) * self.period_attn_scale  # B, G
-        period_weight = torch.softmax(period_logits, dim=1)
+        period_logits = torch.matmul(
+            query_token.unsqueeze(2), key_token.transpose(2, 3)
+        ).squeeze(2) * self.period_attn_scale  # B, C, G
+        period_weight = torch.softmax(period_logits, dim=2)  # B, C, G
         period_weight = self.period_attn_dropout(period_weight)
-        period_weight = period_weight / period_weight.sum(dim=1, keepdim=True).clamp_min(1e-6)
-        retrieval_agg = (pred_stack * period_weight.unsqueeze(-1).unsqueeze(-1)).sum(dim=1)  # B, P, C
+        period_weight = period_weight / period_weight.sum(dim=2, keepdim=True).clamp_min(1e-6)
+
+        retrieval_agg = (period_signal * period_weight.unsqueeze(-1)).sum(dim=2).permute(0, 2, 1)  # B, P, C
 
         # Fuse once: aggregated multi-scale retrieval + base prediction.
         retrieval_feature = retrieval_agg.permute(0, 2, 1)  # B, C, P
@@ -316,58 +246,48 @@ class Model(nn.Module):
         pred = pred + x_offset
         return pred
 
-    def forecast(self, x_enc, index, mode, meta_data=None, meta_text=None, meta_text_by_period=None):
+    def forecast(self, x_enc, index, mode, meta_data=None):
         return self.encoder(
             x_enc,
             index,
             mode,
             meta_data=meta_data,
-            meta_text=meta_text,
-            meta_text_by_period=meta_text_by_period,
         )
 
-    def imputation(self, x_enc, index, mode, meta_data=None, meta_text=None, meta_text_by_period=None):
+    def imputation(self, x_enc, index, mode, meta_data=None):
         return self.encoder(
             x_enc,
             index,
             mode,
             meta_data=meta_data,
-            meta_text=meta_text,
-            meta_text_by_period=meta_text_by_period,
         )
 
-    def anomaly_detection(self, x_enc, index, mode, meta_data=None, meta_text=None, meta_text_by_period=None):
+    def anomaly_detection(self, x_enc, index, mode, meta_data=None):
         return self.encoder(
             x_enc,
             index,
             mode,
             meta_data=meta_data,
-            meta_text=meta_text,
-            meta_text_by_period=meta_text_by_period,
         )
 
-    def classification(self, x_enc, index, mode, meta_data=None, meta_text=None, meta_text_by_period=None):
+    def classification(self, x_enc, index, mode, meta_data=None):
         enc_out = self.encoder(
             x_enc,
             index,
             mode,
             meta_data=meta_data,
-            meta_text=meta_text,
-            meta_text_by_period=meta_text_by_period,
         )
         output = enc_out.reshape(enc_out.shape[0], -1)
         output = self.projection(output)
         return output
 
-    def forward(self, x_enc, index, mode="train", meta_data=None, meta_text=None, meta_text_by_period=None):
+    def forward(self, x_enc, index, mode="train", meta_data=None):
         if self.task_name in ["long_term_forecast", "short_term_forecast"]:
             dec_out = self.forecast(
                 x_enc,
                 index,
                 mode,
                 meta_data=meta_data,
-                meta_text=meta_text,
-                meta_text_by_period=meta_text_by_period,
             )
             return dec_out[:, -self.pred_len:, :]
         if self.task_name == "imputation":
@@ -376,8 +296,6 @@ class Model(nn.Module):
                 index,
                 mode,
                 meta_data=meta_data,
-                meta_text=meta_text,
-                meta_text_by_period=meta_text_by_period,
             )
         if self.task_name == "anomaly_detection":
             return self.anomaly_detection(
@@ -385,8 +303,6 @@ class Model(nn.Module):
                 index,
                 mode,
                 meta_data=meta_data,
-                meta_text=meta_text,
-                meta_text_by_period=meta_text_by_period,
             )
         if self.task_name == "classification":
             return self.classification(
@@ -394,7 +310,5 @@ class Model(nn.Module):
                 index,
                 mode,
                 meta_data=meta_data,
-                meta_text=meta_text,
-                meta_text_by_period=meta_text_by_period,
             )
         return None

@@ -47,14 +47,12 @@ def build_sample_meta(dataset, index, seq_x):
     s_end = index + dataset.seq_len
     anchor_idx = min(s_end - 1, len(dataset.date_index) - 1)
     timestamp = dataset.date_index.iloc[anchor_idx]
-    meta_data, _, _ = build_meta_record(
+    meta_data = build_meta_record(
         timestamp=timestamp,
         dataset_name=dataset.dataset_name,
         target=dataset.target,
         feature_names=dataset.feature_names,
         seq_x=seq_x,
-        prompt_factory=None,
-        build_text=False,
     )
     return _compact_numeric_meta(meta_data)
 

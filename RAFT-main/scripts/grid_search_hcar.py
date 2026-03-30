@@ -131,16 +131,11 @@ def main():
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--model_prefix", type=str, default="HCARGrid")
-    parser.add_argument("--text_encoder_name", type=str, default="./models/bert-base-uncased")
     parser.add_argument("--retrieval_cache_device", type=str, default="gpu", choices=["cpu", "gpu"])
-    parser.add_argument("--text_cache_device", type=str, default="gpu", choices=["cpu", "gpu"])
     parser.add_argument("--traffic_cache_device", type=str, default="cpu", choices=["cpu", "gpu"])
-    parser.add_argument("--traffic_text_cache_device", type=str, default="cpu", choices=["cpu", "gpu"])
     parser.add_argument("--max_trials", type=int, default=0, help="0 means no limit.")
 
     parser.add_argument("--use_amp", action="store_true")
-    parser.add_argument("--require_text_encoder", action="store_true")
-    parser.add_argument("--save_meta_texts", action="store_true")
     parser.add_argument("--freeze_context_encoder", action="store_true")
     parser.add_argument("--no_refresh_context_each_epoch", action="store_true")
     parser.add_argument("--selection_metric", type=str, default="vali_loss_min", choices=["vali_loss_min", "mse"],
@@ -218,10 +213,8 @@ def main():
             for seq_len, learning_rate, topm, coarse_k, n_period, context_dim in grid:
                 trial_id += 1
                 retrieval_cache_device_run = args.retrieval_cache_device
-                text_cache_device_run = args.text_cache_device
                 if dataset == "traffic":
                     retrieval_cache_device_run = args.traffic_cache_device
-                    text_cache_device_run = args.traffic_text_cache_device
                 model_id = (
                     f"{args.model_prefix}_{dataset}_pl{pred_len}"
                     f"_lb{seq_len}_lr{learning_rate:.0e}"
@@ -248,22 +241,16 @@ def main():
                     "--retrieval_alpha", str(fixed_retrieval_alpha),
                     "--context_dim", str(context_dim),
                     "--retrieval_cache_device", retrieval_cache_device_run,
-                    "--text_cache_device", text_cache_device_run,
                     "--batch_size", str(args.batch_size),
                     "--train_epochs", str(args.train_epochs),
                     "--learning_rate", str(learning_rate),
                     "--lradj", "cosine",
                     "--num_workers", str(args.num_workers),
-                    "--text_encoder_name", args.text_encoder_name,
                     "--online_retrieval",
                 ]
 
                 if args.use_amp:
                     cmd.append("--use_amp")
-                if args.require_text_encoder:
-                    cmd.append("--require_text_encoder")
-                if args.save_meta_texts:
-                    cmd.append("--save_meta_texts")
                 if args.freeze_context_encoder:
                     cmd.append("--freeze_context_encoder")
                 if args.no_refresh_context_each_epoch:
@@ -274,7 +261,7 @@ def main():
                     f"[Trial {trial_id}] dataset={dataset} pred_len={pred_len} "
                     f"lookback={seq_len} lr={learning_rate:.0e} topm={topm} coarse_k={coarse_k} "
                     f"n_period={n_period} context_dim={context_dim} retrieval_alpha={fixed_retrieval_alpha:.2f} "
-                    f"cache={retrieval_cache_device_run}/{text_cache_device_run}"
+                    f"cache={retrieval_cache_device_run}"
                 )
                 print(f"[Trial {trial_id}] log={log_file}")
                 print("=" * 100)

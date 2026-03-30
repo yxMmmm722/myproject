@@ -1,6 +1,6 @@
 import hashlib
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, Tuple
 
 import numpy as np
 import pandas as pd
@@ -315,103 +315,13 @@ def _build_generic_meta(base: Dict) -> Dict:
     }
 
 
-class PromptFactory:
-    def __init__(self):
-        self.template_catalog = {
-            "ett": "ETT node {physical_location}. Time {hour}:00 on {weekday_name}. Load phase={load_phase}; state={trend_descriptor}/{volatility_descriptor}.",
-            "electricity": "Electricity grid {physical_location}. {weekday_name} {hour}:00, tariff={tariff_name}, holiday={is_holiday}. Demand state={trend_descriptor}/{volatility_descriptor}.",
-            "exchange_rate": "FX market at {trading_session} session, weekday={weekday_name}, month_end={month_end_flag}. Price state={trend_descriptor}/{volatility_descriptor}.",
-            "illness": "Illness stream {physical_location}, epi-week={epi_week}, season={season_name}, flu_season={flu_season_flag}. Incidence state={trend_descriptor}/{volatility_descriptor}.",
-            "traffic": "Traffic group {physical_location}, regime={traffic_regime}, time={hour}:00 {weekday_name}. Congestion state={trend_descriptor}/{volatility_descriptor}.",
-            "weather": "Weather station {physical_location}, season={season_name}, daylight={daylight_flag}, time={hour}:00. Atmosphere state={trend_descriptor}/{volatility_descriptor}.",
-            "generic": "Dataset {dataset_name} at {physical_location}. Time={hour}:00 {weekday_name}, holiday={is_holiday}. State={trend_descriptor}.",
-            "periodic_suffix": "Scale={period}; mean={mean:.4f}, std={std:.4f}, skew={skew:.4f}, slope={slope:.4f}, trend={trend}, volatility={volatility}.",
-        }
-
-    def get_template_catalog(self) -> Dict[str, str]:
-        return dict(self.template_catalog)
-
-    def build(self, meta_data: Dict) -> str:
-        family = meta_data["dataset_family"]
-
-        if family == "ett":
-            return (
-                f"ETT node {meta_data['physical_location']}. "
-                f"Time {meta_data['hour']:02d}:00 on {meta_data['weekday_name']}. "
-                f"Load phase is {meta_data['load_phase']}; state is {meta_data['trend_descriptor']} trend "
-                f"with {meta_data['volatility_descriptor']} volatility."
-            )
-
-        if family == "electricity":
-            return (
-                f"Electricity grid {meta_data['physical_location']}. "
-                f"{meta_data['weekday_name']} {meta_data['hour']:02d}:00, tariff={meta_data['tariff_name']}, "
-                f"holiday={meta_data['is_holiday']}. Demand shows {meta_data['trend_descriptor']} trend "
-                f"with {meta_data['volatility_descriptor']} variance."
-            )
-
-        if family == "exchange_rate":
-            return (
-                f"FX market context at {meta_data['trading_session']} session, "
-                f"weekday={meta_data['weekday_name']}, month_end={meta_data['month_end_flag']}. "
-                f"Price dynamics indicate {meta_data['volatility_descriptor']} volatility and "
-                f"{meta_data['trend_descriptor']} trend."
-            )
-
-        if family == "illness":
-            return (
-                f"Illness surveillance stream {meta_data['physical_location']}, epi-week {meta_data['epi_week']}, "
-                f"season={meta_data['season_name']}, flu_season={meta_data['flu_season_flag']}. "
-                f"Incidence exhibits {meta_data['trend_descriptor']} trend with "
-                f"{meta_data['volatility_descriptor']} fluctuation."
-            )
-
-        if family == "traffic":
-            return (
-                f"Traffic sensor group {meta_data['physical_location']} during {meta_data['traffic_regime']} "
-                f"at {meta_data['hour']:02d}:00 on {meta_data['weekday_name']}. "
-                f"Congestion signal is {meta_data['trend_descriptor']} with "
-                f"{meta_data['volatility_descriptor']} volatility."
-            )
-
-        if family == "weather":
-            return (
-                f"Weather station {meta_data['physical_location']} at {meta_data['hour']:02d}:00, "
-                f"season={meta_data['season_name']}, daylight={meta_data['daylight_flag']}. "
-                f"Atmospheric state is {meta_data['trend_descriptor']} with "
-                f"{meta_data['volatility_descriptor']} variance."
-            )
-
-        return (
-            f"Dataset {meta_data['dataset_name']} at {meta_data['physical_location']}. "
-            f"Time: {meta_data['hour']:02d}:00 on {meta_data['weekday_name']} "
-            f"(holiday={meta_data['is_holiday']}). "
-            f"State: {meta_data['trend_descriptor']} trend with {meta_data['window_std']:.4f} variance."
-        )
-
-    def build_by_period(self, meta_data: Dict, local_state_by_period: np.ndarray) -> List[str]:
-        base_text = self.build(meta_data)
-        texts = []
-        for period, stats in zip(HCAR_PERIODS, local_state_by_period):
-            desc = _state_descriptor_from_stats(np.asarray(stats, dtype=np.float32))
-            suffix = (
-                f"Scale={period}; mean={desc['mean']:.4f}, std={desc['std']:.4f}, "
-                f"skew={desc['skew']:.4f}, slope={desc['slope']:.4f}, "
-                f"trend={desc['trend']}, volatility={desc['volatility']}."
-            )
-            texts.append(f"{base_text} {suffix}")
-        return texts
-
-
 def build_meta_record(
     timestamp,
     dataset_name: str,
     target: str,
     feature_names,
     seq_x: np.ndarray,
-    prompt_factory: PromptFactory,
-    build_text: bool = True,
-) -> Tuple[Dict, str, List[str]]:
+) -> Dict:
     ts = pd.Timestamp(timestamp)
     family = _dataset_family(dataset_name)
     entity = _entity_name(feature_names, target)
@@ -460,9 +370,4 @@ def build_meta_record(
     meta_data["peak_status_id"] = int(meta_data["peak_status_id"])
     meta_data.pop("timestamp", None)
 
-    if not build_text:
-        return meta_data, "", None
-
-    meta_text = prompt_factory.build(meta_data)
-    meta_text_by_period = prompt_factory.build_by_period(meta_data, local_state_by_period)
-    return meta_data, meta_text, meta_text_by_period
+    return meta_data

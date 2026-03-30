@@ -467,8 +467,10 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         self.model.eval()
         amp_enabled = self.args.use_amp and self.args.use_gpu
         cmp_stats_test = None
-        case_export_done = False
-        case_data_pending = []
+        target_case_batches = {0}
+        if bool(getattr(self.args, "retrieval_case_first_last_batches", False)):
+            target_case_batches.add(max(len(test_loader) - 1, 0))
+        exported_case_batches = set()
         with torch.no_grad():
             raft_model = None
             if self.args.model == 'RAFT':
@@ -482,14 +484,15 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
                 batch_x_mark = batch_x_mark.float().to(self.device)
                 batch_y_mark = batch_y_mark.float().to(self.device)
+                case_data_pending = []
 
                 if (
                     self.args.model == 'RAFT'
-                    and (not case_export_done)
-                    and len(case_data_pending) == 0
                     and getattr(self.args, "save_retrieval_cases", False)
                     and raft_model is not None
                     and hasattr(raft_model, "export_wave_meta_topm_case")
+                    and (i in target_case_batches)
+                    and (i not in exported_case_batches)
                 ):
                     rt = getattr(raft_model, "rt", None)
                     period_idx_cfg = int(getattr(self.args, "retrieval_case_period_idx", -1))
@@ -503,8 +506,19 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                     start_sample_idx = int(getattr(self.args, "retrieval_case_sample_idx", 0))
                     start_sample_idx = max(0, min(start_sample_idx, batch_x.shape[0] - 1))
                     end_sample_idx = min(start_sample_idx + num_samples, batch_x.shape[0])
-                    sample_indices = list(range(start_sample_idx, end_sample_idx))
+                    if bool(getattr(self.args, "retrieval_case_first_last_samples", False)):
+                        sample_indices = [0, batch_x.shape[0] - 1]
+                        sample_indices = list(dict.fromkeys([int(s) for s in sample_indices if 0 <= int(s) < batch_x.shape[0]]))
+                        if len(sample_indices) == 0:
+                            sample_indices = [0]
+                    else:
+                        sample_indices = list(range(start_sample_idx, end_sample_idx))
                     channel_idx_cfg = int(getattr(self.args, "retrieval_case_channel_idx", -1))
+                    all_channels = bool(getattr(self.args, "retrieval_case_all_channels", False))
+                    if all_channels:
+                        channel_indices = list(range(batch_x.shape[-1]))
+                    else:
+                        channel_indices = [channel_idx_cfg]
 
                     batch_y_future = batch_y[:, -self.args.pred_len:, :]
                     y_mg_all = None
@@ -513,38 +527,39 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
                     for sample_idx in sample_indices:
                         for period_idx in period_indices:
-                            case_data = raft_model.export_wave_meta_topm_case(
-                                x=batch_x,
-                                index=index,
-                                meta_data=meta_data,
-                                sample_idx=sample_idx,
-                                period_idx=period_idx,
-                                channel_idx=channel_idx_cfg,
-                                train=False,
-                            )
-                            if case_data is None:
-                                continue
+                            for channel_idx_loop in channel_indices:
+                                case_data = raft_model.export_wave_meta_topm_case(
+                                    x=batch_x,
+                                    index=index,
+                                    meta_data=meta_data,
+                                    sample_idx=sample_idx,
+                                    period_idx=period_idx,
+                                    channel_idx=channel_idx_loop,
+                                    train=False,
+                                )
+                                if case_data is None:
+                                    continue
 
-                            channel_idx = int(case_data.get("channel_idx", -1))
-                            period_idx_resolved = int(case_data.get("period_idx", -1))
-                            true_future = None
-                            if (
-                                y_mg_all is not None
-                                and 0 <= period_idx_resolved < y_mg_all.shape[0]
-                                and 0 <= channel_idx < batch_y_future.shape[-1]
-                            ):
-                                true_future = y_mg_all[period_idx_resolved, sample_idx, :, channel_idx].detach().cpu().numpy()
-                            elif 0 <= channel_idx < batch_y_future.shape[-1]:
-                                true_future = batch_y_future[sample_idx, :, channel_idx].detach().cpu().numpy()
+                                channel_idx = int(case_data.get("channel_idx", -1))
+                                period_idx_resolved = int(case_data.get("period_idx", -1))
+                                true_future = None
+                                if (
+                                    y_mg_all is not None
+                                    and 0 <= period_idx_resolved < y_mg_all.shape[0]
+                                    and 0 <= channel_idx < batch_y_future.shape[-1]
+                                ):
+                                    true_future = y_mg_all[period_idx_resolved, sample_idx, :, channel_idx].detach().cpu().numpy()
+                                elif 0 <= channel_idx < batch_y_future.shape[-1]:
+                                    true_future = batch_y_future[sample_idx, :, channel_idx].detach().cpu().numpy()
 
-                            if true_future is not None:
-                                case_data["true_future"] = true_future
-                            case_data_pending.append(
-                                {
-                                    "case_data": case_data,
-                                    "sample_idx": sample_idx,
-                                }
-                            )
+                                if true_future is not None:
+                                    case_data["true_future"] = true_future
+                                case_data_pending.append(
+                                    {
+                                        "case_data": case_data,
+                                        "sample_idx": sample_idx,
+                                    }
+                                )
 
                 # decoder input
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
@@ -574,7 +589,6 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
                 if (
                     self.args.model == 'RAFT'
-                    and (not case_export_done)
                     and len(case_data_pending) > 0
                     and raft_model is not None
                 ):
@@ -664,15 +678,14 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                             if meta_pred_future is not None:
                                 case_data["meta_pred_future"] = meta_pred_future
 
-                        tag = f"test_case_s{sample_idx}_p{period_idx}_g{period_g}_c{channel_idx}"
+                        tag = f"test_b{i}_case_s{sample_idx}_p{period_idx}_g{period_g}_c{channel_idx}"
                         self._save_retrieval_case_viz(
                             case_data=case_data,
                             out_dir=os.path.join(folder_path, "retrieval_cases"),
                             tag=tag,
                         )
 
-                    case_export_done = True
-                    case_data_pending = []
+                    exported_case_batches.add(i)
 
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, :]

@@ -1040,7 +1040,7 @@ class RetrievalTool(nn.Module):
             pred_from_retrieval = torch.stack(retrieval_list, dim=0)  # [G, B, P, C]
         return pred_from_retrieval
 
-    def retrieve_all(self, data, train=False, device=torch.device("cpu"), return_texts=False):
+    def retrieve_all(self, data, train=False, device=torch.device("cpu")):
         assert (self.train_data_all_mg is not None) or (self.train_series_x is not None)
 
         rt_loader = DataLoader(
@@ -1052,12 +1052,10 @@ class RetrievalTool(nn.Module):
         )
 
         retrievals = []
-        all_texts = []
         with torch.no_grad():
             for batch in tqdm(rt_loader):
                 index, batch_x, batch_y, batch_x_mark, batch_y_mark = batch[:5]
                 meta_data = batch[5] if len(batch) > 5 else None
-                meta_text = batch[6] if len(batch) > 6 else None
 
                 pred_from_retrieval = self.retrieve(
                     batch_x.float().to(device),
@@ -1067,13 +1065,5 @@ class RetrievalTool(nn.Module):
                 )
                 retrievals.append(pred_from_retrieval.cpu())
 
-                if return_texts:
-                    if meta_text is None:
-                        all_texts.extend([""] * batch_x.shape[0])
-                    else:
-                        all_texts.extend(list(meta_text))
-
         retrievals = torch.cat(retrievals, dim=1)
-        if return_texts:
-            return retrievals, all_texts
         return retrievals

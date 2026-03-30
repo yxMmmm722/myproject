@@ -10,7 +10,6 @@ set -euo pipefail
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 RUN_FILE="${RUN_FILE:-run.py}"
-BERT_PATH="${BERT_PATH:-./models/bert-base-uncased}"
 GRID_SEARCH_SCRIPT="${GRID_SEARCH_SCRIPT:-scripts/grid_search_hcar.py}"
 GRID_CSV="${1:-${GRID_CSV:-}}"
 FORCE_GRID_SEARCH="${FORCE_GRID_SEARCH:-0}"  # 1 => always run grid search first even if GRID_CSV is provided
@@ -44,14 +43,10 @@ GRID_MODEL_PREFIX="${GRID_MODEL_PREFIX:-HCARGrid}"
 
 # Optional feature toggles.
 USE_AMP="${USE_AMP:-1}"  # 1 => add --use_amp
-SAVE_META_TEXTS="${SAVE_META_TEXTS:-1}"  # 1 => add --save_meta_texts
-REQUIRE_TEXT_ENCODER="${REQUIRE_TEXT_ENCODER:-1}"  # 1 => add --require_text_encoder
 FREEZE_CONTEXT_ENCODER="${FREEZE_CONTEXT_ENCODER:-0}"
 NO_REFRESH_CONTEXT_EACH_EPOCH="${NO_REFRESH_CONTEXT_EACH_EPOCH:-0}"
 RETRIEVAL_CACHE_DEVICE="${RETRIEVAL_CACHE_DEVICE:-gpu}"  # cpu|gpu
-TEXT_CACHE_DEVICE="${TEXT_CACHE_DEVICE:-gpu}"  # cpu|gpu
 TRAFFIC_CACHE_DEVICE="${TRAFFIC_CACHE_DEVICE:-cpu}"  # cpu|gpu, used only for traffic
-TRAFFIC_TEXT_CACHE_DEVICE="${TRAFFIC_TEXT_CACHE_DEVICE:-cpu}"  # cpu|gpu, used only for traffic
 
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 LOG_DIR="${LOG_DIR:-./logs/run_best_from_grid_${TIMESTAMP}}"
@@ -88,11 +83,8 @@ if [[ "${FORCE_GRID_SEARCH}" == "1" || -z "${GRID_CSV}" ]]; then
     --output_dir "${GRID_OUTPUT_DIR}"
     --pred_lens "${AUTO_PRED_LENS}"
     --model_prefix "${GRID_MODEL_PREFIX}"
-    --text_encoder_name "${BERT_PATH}"
     --retrieval_cache_device "${RETRIEVAL_CACHE_DEVICE}"
-    --text_cache_device "${TEXT_CACHE_DEVICE}"
     --traffic_cache_device "${TRAFFIC_CACHE_DEVICE}"
-    --traffic_text_cache_device "${TRAFFIC_TEXT_CACHE_DEVICE}"
     --seq_len "${SEQ_LEN}"
     --label_len "${LABEL_LEN}"
     --batch_size "${BATCH_SIZE}"
@@ -119,12 +111,6 @@ if [[ "${FORCE_GRID_SEARCH}" == "1" || -z "${GRID_CSV}" ]]; then
   fi
   if [[ "${USE_AMP}" == "1" ]]; then
     grid_cmd+=(--use_amp)
-  fi
-  if [[ "${REQUIRE_TEXT_ENCODER}" == "1" ]]; then
-    grid_cmd+=(--require_text_encoder)
-  fi
-  if [[ "${SAVE_META_TEXTS}" == "1" ]]; then
-    grid_cmd+=(--save_meta_texts)
   fi
   if [[ "${FREEZE_CONTEXT_ENCODER}" == "1" ]]; then
     grid_cmd+=(--freeze_context_encoder)
@@ -313,10 +299,8 @@ while IFS=$'\t' read -r dataset pred_len best_seq_len best_learning_rate topm co
   fi
 
   retrieval_cache_device_run="${RETRIEVAL_CACHE_DEVICE}"
-  text_cache_device_run="${TEXT_CACHE_DEVICE}"
   if [[ "${dataset}" == "traffic" ]]; then
     retrieval_cache_device_run="${TRAFFIC_CACHE_DEVICE}"
-    text_cache_device_run="${TRAFFIC_TEXT_CACHE_DEVICE}"
   fi
 
   model_id="${MODEL_PREFIX}_${dataset}_pl${pred_len}_lb${seq_len_run}_lr${learning_rate_run}_m${topm}_k${coarse_k}_p${n_period}_cd${context_dim}"
@@ -325,7 +309,7 @@ while IFS=$'\t' read -r dataset pred_len best_seq_len best_learning_rate topm co
   echo "============================================================"
   echo "[RUN ] dataset=${dataset} pred_len=${pred_len} channels=${channels}"
   echo "[BEST] metric=${SELECTION_METRIC} score=${best_score} mse=${best_mse} mae=${best_mae}"
-  echo "[CFG ] seq_len=${seq_len_run} lr=${learning_rate_run} topm=${topm} coarse_k=${coarse_k} n_period=${n_period} context_dim=${context_dim} retrieval_alpha=${retrieval_alpha} cache=${retrieval_cache_device_run}/${text_cache_device_run}"
+  echo "[CFG ] seq_len=${seq_len_run} lr=${learning_rate_run} topm=${topm} coarse_k=${coarse_k} n_period=${n_period} context_dim=${context_dim} retrieval_alpha=${retrieval_alpha} cache=${retrieval_cache_device_run}"
   echo "[LOG ] ${log_file}"
   echo "============================================================"
 
@@ -343,21 +327,13 @@ while IFS=$'\t' read -r dataset pred_len best_seq_len best_learning_rate topm co
     --retrieval_alpha "${retrieval_alpha}"
     --context_dim "${context_dim}"
     --retrieval_cache_device "${retrieval_cache_device_run}"
-    --text_cache_device "${text_cache_device_run}"
     --online_retrieval
-    --text_encoder_name "${BERT_PATH}"
     --batch_size "${BATCH_SIZE}" --train_epochs "${TRAIN_EPOCHS}"
     --learning_rate "${learning_rate_run}" --lradj cosine --num_workers "${NUM_WORKERS}"
   )
 
-  if [[ "${SAVE_META_TEXTS}" == "1" ]]; then
-    cmd+=(--save_meta_texts)
-  fi
   if [[ "${USE_AMP}" == "1" ]]; then
     cmd+=(--use_amp)
-  fi
-  if [[ "${REQUIRE_TEXT_ENCODER}" == "1" ]]; then
-    cmd+=(--require_text_encoder)
   fi
   if [[ "${FREEZE_CONTEXT_ENCODER}" == "1" ]]; then
     cmd+=(--freeze_context_encoder)
