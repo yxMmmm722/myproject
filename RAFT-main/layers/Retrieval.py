@@ -189,6 +189,7 @@ class RetrievalTool(nn.Module):
         self.stream_batch_size = 512
         self.train_data_all = None
         self.train_data_all_mg = None
+        self.train_channel_state_mg = None
         self.y_data_all = None
         self.y_data_all_mg = None
         self.train_series_x = None
@@ -411,11 +412,21 @@ class RetrievalTool(nn.Module):
             raise RuntimeError("Context pool is empty. Call prepare_dataset() before retrieval.")
 
         pool_ctx = self.meta_pool_context.to(device)  # [G, T, D]
-        gsz, bsz, ksz = candidate_idx.shape
-        ctx_dim = pool_ctx.shape[-1]
-        pool_expand = pool_ctx.unsqueeze(1).expand(gsz, bsz, -1, -1)  # [G, B, T, D]
-        gather_idx = candidate_idx.unsqueeze(-1).expand(-1, -1, -1, ctx_dim)
-        return torch.gather(pool_expand, dim=2, index=gather_idx)  # [G, B, K, D]
+        if candidate_idx.dim() == 3:
+            # candidate_idx: [G, B, K] -> [G, B, K, D]
+            gathered = []
+            for g in range(candidate_idx.shape[0]):
+                gathered.append(pool_ctx[g][candidate_idx[g]])
+            return torch.stack(gathered, dim=0)
+
+        if candidate_idx.dim() == 4:
+            # candidate_idx: [G, B, C, K] -> [G, B, C, K, D]
+            gathered = []
+            for g in range(candidate_idx.shape[0]):
+                gathered.append(pool_ctx[g][candidate_idx[g]])
+            return torch.stack(gathered, dim=0)
+
+        raise ValueError(f"Unsupported candidate_idx dim={candidate_idx.dim()}, expected 3 or 4.")
 
     def refresh_context_pool(self, device=torch.device("cpu")):
         if self.train_meta_all is None:
@@ -466,11 +477,13 @@ class RetrievalTool(nn.Module):
             self.train_series_y = torch.tensor(np.asarray(train_data.data_y), dtype=torch.float16).to(cache_device)
             self.train_data_all = None
             self.train_data_all_mg = None
+            self.train_channel_state_mg = None
             self.y_data_all = None
             self.y_data_all_mg = None
         else:
             self.train_data_all = torch.tensor(np.stack(train_data_all, axis=0)).float().to(cache_device)
             self.train_data_all_mg, _ = self.decompose_mg(self.train_data_all)
+            self.train_channel_state_mg = self._extract_channel_state(self.train_data_all_mg).to(cache_device)
             self.y_data_all = torch.tensor(np.stack(y_data_all, axis=0)).float().to(cache_device)
             self.y_data_all_mg, _ = self.decompose_mg(self.y_data_all)
             # Raw banks are not needed after decomposition in cached mode.
@@ -515,6 +528,58 @@ class RetrievalTool(nn.Module):
 
         return mg, offset
 
+    def _extract_channel_state(self, mg):
+        # mg: [G, N, S, C] -> state: [G, N, C, 4]
+        mean = mg.mean(dim=2)
+        std = mg.std(dim=2, unbiased=False)
+        if mg.shape[2] > 1:
+            slope = (mg[:, :, -1, :] - mg[:, :, 0, :]) / float(mg.shape[2] - 1)
+            abs_diff = torch.mean(torch.abs(mg[:, :, 1:, :] - mg[:, :, :-1, :]), dim=2)
+        else:
+            slope = torch.zeros_like(mean)
+            abs_diff = torch.zeros_like(mean)
+        return torch.stack([mean, std, slope, abs_diff], dim=-1)
+
+    def _meta_channel_similarity(self, query_channel_state, self_mask=None, in_bsz=512):
+        # query_channel_state: [G, B, C, 4] -> similarity: [G, B, C, T]
+        q = F.normalize(query_channel_state, dim=-1)
+
+        if self.train_channel_state_mg is not None:
+            pool = self.train_channel_state_mg.to(query_channel_state.device)  # [G, T, C, 4]
+            p = F.normalize(pool, dim=-1)
+            sim = torch.einsum("gbcd,gtcd->gbct", q, p)
+            if self_mask is not None:
+                sim = sim.masked_fill(self_mask.unsqueeze(2), float("-inf"))
+            return sim
+
+        if self.train_series_x is None:
+            raise RuntimeError("Neither cached channel-state bank nor stream series is available.")
+
+        train_len = self.n_train
+        iters = math.ceil(train_len / in_bsz)
+        sim_parts = []
+        for i in range(iters):
+            start_idx = i * in_bsz
+            end_idx = min((i + 1) * in_bsz, train_len)
+            num = end_idx - start_idx
+
+            cand = torch.arange(start_idx, end_idx, device=self.train_series_x.device).unsqueeze(1)
+            off = torch.arange(self.seq_len, device=self.train_series_x.device).unsqueeze(0)
+            win_idx = cand + off  # [num, S]
+            win_idx_flat = win_idx.reshape(-1)
+            cur_data = self.train_series_x.index_select(0, win_idx_flat).reshape(num, self.seq_len, self.channels)
+            cur_data = cur_data.to(query_channel_state.device).float()  # [num, S, C]
+            cur_mg, _ = self.decompose_mg(cur_data)  # [G, num, S, C]
+            cur_state = self._extract_channel_state(cur_mg)  # [G, num, C, 4]
+            p = F.normalize(cur_state, dim=-1)
+            cur_sim = torch.einsum("gbcd,gtcd->gbct", q, p)  # [G, B, C, num]
+            sim_parts.append(cur_sim)
+
+        sim = torch.cat(sim_parts, dim=3)
+        if self_mask is not None:
+            sim = sim.masked_fill(self_mask.unsqueeze(2), float("-inf"))
+        return sim
+
     def periodic_batch_corr(self, data_all, key, in_bsz=512):
         _, bsz, _ = key.shape
         _, train_len, _ = data_all.shape
@@ -533,6 +598,28 @@ class RetrievalTool(nn.Module):
             sim.append(cur_sim)
 
         return torch.cat(sim, dim=2)
+
+    def periodic_batch_corr_channelwise(self, data_all, key, in_bsz=512):
+        # data_all: [G, T, S, C], key: [G, B, S, C] -> sim: [G, B, C, T]
+        _, bsz, _, _ = key.shape
+        _, train_len, _, _ = data_all.shape
+
+        bx = key - torch.mean(key, dim=2, keepdim=True)
+        bx = F.normalize(bx, dim=2)
+        iters = math.ceil(train_len / in_bsz)
+
+        sim = []
+        for i in range(iters):
+            start_idx = i * in_bsz
+            end_idx = min((i + 1) * in_bsz, train_len)
+
+            cur_data = data_all[:, start_idx:end_idx].to(key.device)
+            ax = cur_data - torch.mean(cur_data, dim=2, keepdim=True)
+            ax = F.normalize(ax, dim=2)
+            cur_sim = torch.einsum("gbsc,gtsc->gbct", bx, ax)
+            sim.append(cur_sim)
+
+        return torch.cat(sim, dim=3)
 
     def periodic_batch_corr_stream(self, key, in_bsz=32):
         _, bsz, _ = key.shape
@@ -562,10 +649,45 @@ class RetrievalTool(nn.Module):
 
         return torch.cat(sim, dim=2)
 
+    def periodic_batch_corr_stream_channelwise(self, key, in_bsz=32):
+        # key: [G, B, S, C] -> sim: [G, B, C, T]
+        _, bsz, _, _ = key.shape
+        train_len = self.n_train
+        bx = key - torch.mean(key, dim=2, keepdim=True)
+        bx = F.normalize(bx, dim=2)
+        iters = math.ceil(train_len / in_bsz)
+
+        sim = []
+        for i in range(iters):
+            start_idx = i * in_bsz
+            end_idx = min((i + 1) * in_bsz, train_len)
+            if self.train_series_x is None:
+                raise RuntimeError("train_series_x is not initialized in low_mem_stream mode.")
+
+            num = end_idx - start_idx
+            cand = torch.arange(start_idx, end_idx, device=self.train_series_x.device).unsqueeze(1)
+            off = torch.arange(self.seq_len, device=self.train_series_x.device).unsqueeze(0)
+            win_idx = cand + off  # [num, S]
+            win_idx_flat = win_idx.reshape(-1)
+            cur_data = self.train_series_x.index_select(0, win_idx_flat).reshape(num, self.seq_len, self.channels)
+            cur_data = cur_data.to(key.device).float()  # [num, S, C]
+            cur_data_mg, _ = self.decompose_mg(cur_data)  # [G, T, S, C]
+            ax = cur_data_mg - torch.mean(cur_data_mg, dim=2, keepdim=True)
+            ax = F.normalize(ax, dim=2)
+            cur_sim = torch.einsum("gbsc,gtsc->gbct", bx, ax)
+            sim.append(cur_sim)
+
+        return torch.cat(sim, dim=3)
+
     def context_similarity(self, query_ctx, candidate_ctx):
-        query_norm = F.normalize(query_ctx, dim=-1).unsqueeze(2)  # [G, B, 1, D]
-        cand_norm = F.normalize(candidate_ctx, dim=-1)  # [G, B, K, D]
-        return (query_norm * cand_norm).sum(dim=-1)  # [G, B, K]
+        cand_norm = F.normalize(candidate_ctx, dim=-1)
+        if candidate_ctx.dim() == 4:
+            query_norm = F.normalize(query_ctx, dim=-1).unsqueeze(2)  # [G, B, 1, D]
+            return (query_norm * cand_norm).sum(dim=-1)  # [G, B, K]
+        if candidate_ctx.dim() == 5:
+            query_norm = F.normalize(query_ctx, dim=-1).unsqueeze(2).unsqueeze(3)  # [G, B, 1, 1, D]
+            return (query_norm * cand_norm).sum(dim=-1)  # [G, B, C, K]
+        raise ValueError(f"Unsupported candidate_ctx dim={candidate_ctx.dim()}, expected 4 or 5.")
 
     def reset_retrieval_compare_stats(self):
         self.compare_stat_calls = 0
@@ -597,30 +719,32 @@ class RetrievalTool(nn.Module):
         topm = min(self.topm, wave_idx.shape[-1], meta_idx.shape[-1])
         if topm <= 0:
             return
-        wave_top = wave_idx[:, :, :topm]
-        meta_top = meta_idx[:, :, :topm]
+        wave_top = wave_idx[..., :topm]
+        meta_top = meta_idx[..., :topm]
 
-        # Set-level overlap@m.
-        overlap_cnt = (wave_top.unsqueeze(-1) == meta_top.unsqueeze(-2)).any(dim=-1).float().sum(dim=-1)  # [G, B]
+        # Flatten all leading dimensions as independent compare pairs.
+        wave_flat = wave_top.reshape(-1, topm)  # [N, m]
+        meta_flat = meta_top.reshape(-1, topm)  # [N, m]
+
+        overlap_cnt = (wave_flat.unsqueeze(-1) == meta_flat.unsqueeze(-2)).any(dim=-1).float().sum(dim=-1)  # [N]
         overlap_ratio = overlap_cnt / float(topm)
         exact_set = (overlap_cnt == float(topm)).float()
-        # Order-level exact match.
-        exact_order = (wave_top == meta_top).all(dim=-1).float()
-        rank_match = (wave_top == meta_top).float().sum(dim=(0, 1))  # [m]
+        exact_order = (wave_flat == meta_flat).all(dim=-1).float()
+        rank_match = (wave_flat == meta_flat).float().sum(dim=0)  # [m]
 
         self.compare_stat_calls += 1
         self.compare_overlap_sum += float(overlap_ratio.mean().item())
         self.compare_exact_set_sum += float(exact_set.mean().item())
         self.compare_exact_order_sum += float(exact_order.mean().item())
-        self.compare_pair_count += int(wave_top.shape[0] * wave_top.shape[1])
+        self.compare_pair_count += int(wave_flat.shape[0])
         self.compare_rank_match_sum[:topm] += rank_match.detach().cpu().numpy()
 
         hist = torch.bincount(overlap_cnt.long().reshape(-1), minlength=topm + 1).float().cpu().numpy()
         self.compare_overlap_hist[: topm + 1] += hist
         if self.compare_first_example is None:
             self.compare_first_example = {
-                "wave_topm": wave_top[0, 0].detach().cpu().tolist(),
-                "meta_topm": meta_top[0, 0].detach().cpu().tolist(),
+                "wave_topm": wave_flat[0].detach().cpu().tolist(),
+                "meta_topm": meta_flat[0].detach().cpu().tolist(),
             }
 
         if self.compare_log_interval > 0 and (self.compare_stat_calls % self.compare_log_interval == 0):
@@ -655,32 +779,40 @@ class RetrievalTool(nn.Module):
         if train:
             self_mask = self._build_train_self_mask(index, bsz, x.device)  # [G, B, T]
 
+        # Build per-channel query meta state for channel-independent meta retrieval.
+        x_mg, _ = self.decompose_mg(x)  # [G, B, S, C]
+        query_channel_state = self._extract_channel_state(x_mg)  # [G, B, C, 4]
+
         need_wave = force_wave or (not self.meta_only_retrieval) or self.compare_retrieval_topk
         sim_wave, wave_idx, wave_score = None, None, None
         if need_wave:
-            x_mg, _ = self.decompose_mg(x)  # [G, B, S, C]
-            x_key = x_mg.flatten(start_dim=2)  # [G, B, S*C]
             if self.train_data_all_mg is not None:
-                sim_wave = self.periodic_batch_corr(
-                    self.train_data_all_mg.flatten(start_dim=2),  # [G, T, S*C]
-                    x_key,
-                )  # [G, B, T]
+                sim_wave = self.periodic_batch_corr_channelwise(
+                    self.train_data_all_mg,  # [G, T, S, C]
+                    x_mg,  # [G, B, S, C]
+                )  # [G, B, C, T]
             else:
-                sim_wave = self.periodic_batch_corr_stream(
-                    x_key,
+                sim_wave = self.periodic_batch_corr_stream_channelwise(
+                    x_mg,
                     in_bsz=self.stream_batch_size,
-                )  # [G, B, T]
+                )  # [G, B, C, T]
             if self_mask is not None:
-                sim_wave = sim_wave.masked_fill(self_mask, float("-inf"))
-            wave_score, wave_idx = torch.topk(sim_wave, select_k, dim=2)  # [G, B, k]
+                sim_wave = sim_wave.masked_fill(self_mask.unsqueeze(2), float("-inf"))
+            wave_score, wave_idx = torch.topk(sim_wave, select_k, dim=3)  # [G, B, C, k]
 
         # Meta-context-only top-m.
         pool_ctx = self.meta_pool_context.to(x.device)  # [G, T, D]
-        pool_ctx_expand = pool_ctx.unsqueeze(1).expand(-1, bsz, -1, -1)  # [G, B, T, D]
-        full_context = self.context_similarity(query_ctx, pool_ctx_expand)  # [G, B, T]
-        if self_mask is not None:
-            full_context = full_context.masked_fill(self_mask, float("-inf"))
-        meta_score, meta_idx = torch.topk(full_context, select_k, dim=2)  # [G, B, k]
+        query_norm = F.normalize(query_ctx, dim=-1)  # [G, B, D]
+        pool_norm = F.normalize(pool_ctx, dim=-1)  # [G, T, D]
+        full_context = torch.bmm(query_norm, pool_norm.transpose(1, 2))  # [G, B, T]
+        channel_context = self._meta_channel_similarity(
+            query_channel_state,
+            self_mask=self_mask,
+            in_bsz=self.stream_batch_size,
+        )  # [G, B, C, T]
+        # Fuse global meta context + channel-local meta state.
+        meta_sim = channel_context + full_context.unsqueeze(2)  # [G, B, C, T]
+        meta_score, meta_idx = torch.topk(meta_sim, select_k, dim=3)  # [G, B, C, k]
 
         return {
             "select_k": select_k,
@@ -750,16 +882,22 @@ class RetrievalTool(nn.Module):
             require_grad=False,
             force_wave=True,
         )
-        wave_idx = out["wave_idx"]  # [G, B, m]
-        meta_idx = out["meta_idx"]  # [G, B, m]
+        wave_idx = out["wave_idx"]
+        meta_idx = out["meta_idx"]
         select_k = int(out["select_k"])
 
         if channel_idx < 0:
             channel_idx = self.channels + int(channel_idx)
         channel_idx = max(0, min(int(channel_idx), self.channels - 1))
 
-        wave_sel = wave_idx[period_idx, sample_idx, :select_k]
-        meta_sel = meta_idx[period_idx, sample_idx, :select_k]
+        if wave_idx.dim() == 4:
+            wave_sel = wave_idx[period_idx, sample_idx, channel_idx, :select_k]
+        else:
+            wave_sel = wave_idx[period_idx, sample_idx, :select_k]
+        if meta_idx.dim() == 4:
+            meta_sel = meta_idx[period_idx, sample_idx, channel_idx, :select_k]
+        else:
+            meta_sel = meta_idx[period_idx, sample_idx, :select_k]
         wave_hist, wave_fut = self._gather_candidate_hist_future(wave_sel, period_idx, x.device)
         meta_hist, meta_fut = self._gather_candidate_hist_future(meta_sel, period_idx, x.device)
 
@@ -816,12 +954,15 @@ class RetrievalTool(nn.Module):
             selected_global_idx = wave_idx
             selected_wave = wave_score
 
-        selected_ctx = self._gather_candidate_context(selected_global_idx, x.device)  # [G, B, k, D]
+        selected_ctx = self._gather_candidate_context(selected_global_idx, x.device)  # [G, B, C, k, D] or [G, B, k, D]
         if not self.meta_only_retrieval:
-            selected_context = self.context_similarity(query_ctx, selected_ctx)  # [G, B, k]
+            selected_context = self.context_similarity(query_ctx, selected_ctx)  # [G, B, C, k] or [G, B, k]
 
         if self.use_gated_aggregation:
-            query_expand = query_ctx.unsqueeze(2).expand(-1, -1, select_k, -1)  # [G, B, k, D]
+            if selected_ctx.dim() == 5:
+                query_expand = query_ctx.unsqueeze(2).unsqueeze(3).expand(-1, -1, channels, select_k, -1)  # [G, B, C, k, D]
+            else:
+                query_expand = query_ctx.unsqueeze(2).expand(-1, -1, select_k, -1)  # [G, B, k, D]
             gate_input = torch.cat(
                 [
                     query_expand,
@@ -830,38 +971,72 @@ class RetrievalTool(nn.Module):
                     selected_context.unsqueeze(-1),
                 ],
                 dim=-1,
-            )  # [G, B, k, 2D+2]
-            gate_logits = self.candidate_gate(gate_input).squeeze(-1)  # [G, B, k]
-            ranking_prob = F.softmax(gate_logits, dim=2)
+            )
+            gate_logits = self.candidate_gate(gate_input).squeeze(-1)
+            ranking_prob = F.softmax(gate_logits, dim=-1)
         else:
             base_score = selected_context if self.meta_only_retrieval else selected_wave
-            ranking_prob = F.softmax(base_score / self.temperature, dim=2)
+            ranking_prob = F.softmax(base_score / self.temperature, dim=-1)
 
         if self.y_data_all_mg is not None:
-            y_data_all = self.y_data_all_mg.flatten(start_dim=2).to(x.device)  # [G, T, P*C]
-            y_expand = y_data_all.unsqueeze(1).expand(-1, bsz, -1, -1)  # [G, B, T, P*C]
-            gather_idx = selected_global_idx.unsqueeze(-1).expand(-1, -1, -1, y_data_all.shape[-1])
-            selected_y = torch.gather(y_expand, dim=2, index=gather_idx)  # [G, B, m, P*C]
-            pred_from_retrieval = (ranking_prob.unsqueeze(-1) * selected_y).sum(dim=2)
-            pred_from_retrieval = pred_from_retrieval.reshape(self.n_period, bsz, -1, channels)
+            y_bank = self.y_data_all_mg.to(x.device).float()  # [G, T, P, C]
+            retrieval_list = []
+            for g_i in range(self.n_period):
+                idx_g = selected_global_idx[g_i]
+                prob_g = ranking_prob[g_i]
+                if idx_g.dim() == 2:
+                    selected_y = y_bank[g_i][idx_g]  # [B, k, P, C]
+                    weighted = (prob_g.unsqueeze(-1).unsqueeze(-1) * selected_y).sum(dim=1)  # [B, P, C]
+                    retrieval_list.append(weighted)
+                    continue
+
+                pred_g = torch.zeros((bsz, self.pred_len, channels), device=x.device, dtype=y_bank.dtype)
+                for c_i in range(channels):
+                    idx_bc = idx_g[:, c_i, :]  # [B, k]
+                    cand_c = y_bank[g_i, :, :, c_i][idx_bc]  # [B, k, P]
+                    w_c = prob_g[:, c_i, :].unsqueeze(-1)  # [B, k, 1]
+                    pred_g[:, :, c_i] = (w_c * cand_c).sum(dim=1)  # [B, P]
+                retrieval_list.append(pred_g)
+            pred_from_retrieval = torch.stack(retrieval_list, dim=0)  # [G, B, P, C]
         else:
             if self.train_series_y is None:
                 raise RuntimeError("train_series_y is not initialized in low_mem_stream mode.")
             retrieval_list = []
             y_off = torch.arange(self.pred_len, device=self.train_series_y.device).unsqueeze(0)  # [1, P]
             for g_i, g in enumerate(self.period_num):
-                cand_idx = selected_global_idx[g_i].reshape(-1).to(self.train_series_y.device).unsqueeze(1)  # [B*m, 1]
-                y_idx = cand_idx + self.seq_len + y_off  # [B*m, P]
-                y_idx_flat = y_idx.reshape(-1)
-                selected_raw = self.train_series_y.index_select(0, y_idx_flat).reshape(
-                    bsz * select_k, self.pred_len, channels
-                ).to(x.device).float()  # [B*m, P, C]
-                cur = selected_raw.unfold(dimension=1, size=g, step=g).mean(dim=-1)
-                cur = cur.repeat_interleave(repeats=g, dim=1)
-                cur = cur - cur[:, -1:, :]
-                cur = cur.reshape(bsz, select_k, self.pred_len, channels)  # [B, m, P, C]
-                weighted = (ranking_prob[g_i].unsqueeze(-1).unsqueeze(-1) * cur).sum(dim=1)  # [B, P, C]
-                retrieval_list.append(weighted)
+                idx_g = selected_global_idx[g_i]
+                prob_g = ranking_prob[g_i]
+
+                if idx_g.dim() == 2:
+                    cand_idx = idx_g.reshape(-1).to(self.train_series_y.device).unsqueeze(1)  # [B*m, 1]
+                    y_idx = cand_idx + self.seq_len + y_off  # [B*m, P]
+                    y_idx_flat = y_idx.reshape(-1)
+                    selected_raw = self.train_series_y.index_select(0, y_idx_flat).reshape(
+                        bsz * select_k, self.pred_len, channels
+                    ).to(x.device).float()  # [B*m, P, C]
+                    cur = selected_raw.unfold(dimension=1, size=g, step=g).mean(dim=-1)
+                    cur = cur.repeat_interleave(repeats=g, dim=1)
+                    cur = cur - cur[:, -1:, :]
+                    cur = cur.reshape(bsz, select_k, self.pred_len, channels)  # [B, m, P, C]
+                    weighted = (prob_g.unsqueeze(-1).unsqueeze(-1) * cur).sum(dim=1)  # [B, P, C]
+                    retrieval_list.append(weighted)
+                    continue
+
+                pred_g = torch.zeros((bsz, self.pred_len, channels), device=x.device, dtype=torch.float32)
+                for c_i in range(channels):
+                    cand_idx = idx_g[:, c_i, :].reshape(-1).to(self.train_series_y.device).unsqueeze(1)  # [B*m, 1]
+                    y_idx = cand_idx + self.seq_len + y_off  # [B*m, P]
+                    y_idx_flat = y_idx.reshape(-1)
+                    selected_raw_c = self.train_series_y[:, c_i].index_select(0, y_idx_flat).reshape(
+                        bsz * select_k, self.pred_len
+                    ).to(x.device).float()  # [B*m, P]
+                    cur = selected_raw_c.unfold(dimension=1, size=g, step=g).mean(dim=-1)
+                    cur = cur.repeat_interleave(repeats=g, dim=1)
+                    cur = cur - cur[:, -1:]
+                    cur = cur.reshape(bsz, select_k, self.pred_len)  # [B, m, P]
+                    weighted_c = (prob_g[:, c_i, :].unsqueeze(-1) * cur).sum(dim=1)  # [B, P]
+                    pred_g[:, :, c_i] = weighted_c
+                retrieval_list.append(pred_g)
             pred_from_retrieval = torch.stack(retrieval_list, dim=0)  # [G, B, P, C]
         return pred_from_retrieval
 
