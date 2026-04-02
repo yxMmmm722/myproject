@@ -1,6 +1,4 @@
-import copy
 import math
-from typing import Dict
 
 import numpy as np
 import torch
@@ -8,105 +6,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-
-
-class HierarchicalContextEncoder(nn.Module):
-    def __init__(self, period_count: int, context_dim: int = 64, cat_dim: int = 16):
-        super().__init__()
-        self.period_count = period_count
-
-        # Layer-1/2 categorical embeddings (dataset + temporal + scenario ids).
-        self.dataset_emb = nn.Embedding(2048, cat_dim)
-        self.sensor_emb = nn.Embedding(256, cat_dim)
-        self.location_emb = nn.Embedding(4096, cat_dim)
-        self.hour_emb = nn.Embedding(24, cat_dim)
-        self.weekday_emb = nn.Embedding(7, cat_dim)
-        self.month_emb = nn.Embedding(13, cat_dim)
-        self.week_emb = nn.Embedding(54, cat_dim)
-        self.season_emb = nn.Embedding(4, cat_dim)
-        self.holiday_emb = nn.Embedding(2, cat_dim)
-        self.peak_emb = nn.Embedding(2, cat_dim)
-        self.regime_emb = nn.Embedding(16, cat_dim)
-        self.event_emb = nn.Embedding(8, cat_dim)
-        self.trend_state_emb = nn.Embedding(3, cat_dim)
-        self.vol_state_emb = nn.Embedding(3, cat_dim)
-        self.shape_state_emb = nn.Embedding(3, cat_dim)
-        self.reliability_emb = nn.Embedding(3, cat_dim)
-        self.month_end_emb = nn.Embedding(2, cat_dim)
-
-        cat_total_dim = cat_dim * 17
-        self.cat_proj = nn.Sequential(
-            nn.Linear(cat_total_dim, context_dim),
-            nn.GELU(),
-            nn.Linear(context_dim, context_dim),
-        )
-        self.exo_proj = nn.Sequential(
-            nn.Linear(8, context_dim),
-            nn.GELU(),
-            nn.Linear(context_dim, context_dim),
-        )
-
-        # Layer-3 numerical projection (mean, std, skewness, slope).
-        self.local_proj = nn.Sequential(
-            nn.Linear(4, context_dim),
-            nn.GELU(),
-            nn.Linear(context_dim, context_dim),
-        )
-        self.norm = nn.LayerNorm(context_dim)
-
-    def forward(self, meta_batch: Dict[str, torch.Tensor]):
-        dataset = meta_batch["dataset_id"].long()
-        sensor = meta_batch["sensor_type_id"].long()
-        location = meta_batch["physical_location_id"].long()
-        hour = meta_batch["hour"].long().clamp(0, 23)
-        weekday = meta_batch["day_of_week"].long().clamp(0, 6)
-        month = meta_batch["month"].long().clamp(1, 12)
-        week = meta_batch["week_of_year"].long().clamp(1, 53)
-        season = meta_batch["season_id"].long().clamp(0, 3)
-        holiday = meta_batch["is_holiday"].long().clamp(0, 1)
-        peak = meta_batch["peak_status_id"].long().clamp(0, 1)
-        regime = meta_batch["regime_id"].long().clamp(0, 15)
-        event = meta_batch["event_id"].long().clamp(0, 7)
-        trend_state = meta_batch["trend_state_id"].long().clamp(0, 2)
-        vol_state = meta_batch["volatility_state_id"].long().clamp(0, 2)
-        shape_state = meta_batch["shape_state_id"].long().clamp(0, 2)
-        reliability = meta_batch["reliability_id"].long().clamp(0, 2)
-        month_end = meta_batch["month_end_flag"].long().clamp(0, 1)
-
-        cat_context = torch.cat(
-            [
-                self.dataset_emb(dataset),
-                self.sensor_emb(sensor),
-                self.location_emb(location),
-                self.hour_emb(hour),
-                self.weekday_emb(weekday),
-                self.month_emb(month),
-                self.week_emb(week),
-                self.season_emb(season),
-                self.holiday_emb(holiday),
-                self.peak_emb(peak),
-                self.regime_emb(regime),
-                self.event_emb(event),
-                self.trend_state_emb(trend_state),
-                self.vol_state_emb(vol_state),
-                self.shape_state_emb(shape_state),
-                self.reliability_emb(reliability),
-                self.month_end_emb(month_end),
-            ],
-            dim=1,
-        )
-        cat_context = self.cat_proj(cat_context)  # [B, D]
-        exogenous = meta_batch["exogenous_vars"].float()
-        exo_context = self.exo_proj(exogenous)  # [B, D]
-        cat_context = cat_context + exo_context
-
-        local_state = meta_batch["local_state_by_period"].float()  # [B, G, 4]
-        local_state = local_state[:, : self.period_count, :]
-        bsz, gsz, _ = local_state.shape
-
-        local_context = self.local_proj(local_state.reshape(-1, 4)).reshape(bsz, gsz, -1)  # [B, G, D]
-        context = self.norm(cat_context.unsqueeze(1) + local_context)
-        return context.permute(1, 0, 2)  # [G, B, D]
 
 
 class RetrievalTool(nn.Module):
@@ -118,15 +17,8 @@ class RetrievalTool(nn.Module):
         n_period=3,
         temperature=0.1,
         topm=20,
-        alpha=0.7,
-        coarse_k=80,
-        context_dim=64,
-        gate_hidden_dim=128,
-        use_gated_aggregation=True,
         with_dec=False,
         return_key=False,
-        learnable_alpha=False,
-        train_context_encoder=True,
         meta_only_retrieval=False,
         compare_retrieval_topk=False,
         compare_log_interval=100,
@@ -144,47 +36,12 @@ class RetrievalTool(nn.Module):
 
         self.temperature = temperature
         self.topm = topm
-        self.coarse_k = max(topm, coarse_k)
-        self.train_context_encoder = bool(train_context_encoder)
-        self.context_dim = int(context_dim)
-        self.use_gated_aggregation = bool(use_gated_aggregation)
         self.meta_only_retrieval = bool(meta_only_retrieval)
         self.compare_retrieval_topk = bool(compare_retrieval_topk)
         self.compare_log_interval = int(compare_log_interval)
-
-        self.learnable_alpha = learnable_alpha
-        if self.learnable_alpha:
-            # Sigmoid(alpha_logit) in (0, 1).
-            alpha = min(max(alpha, 1e-4), 1.0 - 1e-4)
-            self.alpha_logit = nn.Parameter(torch.logit(torch.tensor(float(alpha))))
-        else:
-            self.register_buffer("alpha_const", torch.tensor(float(alpha)))
-
         self.with_dec = with_dec
         self.return_key = return_key
 
-        self.context_encoder = HierarchicalContextEncoder(
-            period_count=self.n_period,
-            context_dim=context_dim,
-            cat_dim=16,
-        )
-        gate_in_dim = self.context_dim * 2 + 2
-        self.candidate_gate = nn.Sequential(
-            nn.Linear(gate_in_dim, gate_hidden_dim),
-            nn.GELU(),
-            nn.Linear(gate_hidden_dim, 1),
-        )
-        if self.train_context_encoder:
-            self.context_encoder.train()
-        else:
-            self.context_encoder.eval()
-
-        self.local_state_mean = None
-        self.local_state_std = None
-        self.exogenous_mean = None
-        self.exogenous_std = None
-        self.meta_pool_context = None
-        self.train_meta_all = None
         self.low_mem_stream = False
         self.stream_batch_size = 512
         self.train_data_all = None
@@ -196,256 +53,9 @@ class RetrievalTool(nn.Module):
         self.train_series_y = None
         self.reset_retrieval_compare_stats()
 
-    @staticmethod
-    def _to_tensor(value, dtype=torch.float32):
-        if torch.is_tensor(value):
-            return value.to(dtype=dtype)
-        if isinstance(value, np.ndarray):
-            return torch.tensor(value, dtype=dtype)
-        if isinstance(value, list):
-            return torch.tensor(value, dtype=dtype)
-        return torch.tensor(value, dtype=dtype)
-
-    def _meta_from_records(self, records):
-        bsz = len(records)
-        local_state_list = []
-        packed = {
-            "dataset_id": [],
-            "sensor_type_id": [],
-            "physical_location_id": [],
-            "hour": [],
-            "day_of_week": [],
-            "month": [],
-            "week_of_year": [],
-            "season_id": [],
-            "is_holiday": [],
-            "peak_status_id": [],
-            "regime_id": [],
-            "event_id": [],
-            "trend_state_id": [],
-            "volatility_state_id": [],
-            "shape_state_id": [],
-            "reliability_id": [],
-            "month_end_flag": [],
-        }
-        exogenous_list = []
-
-        for meta in records:
-            meta = meta or {}
-            packed["dataset_id"].append(int(meta.get("dataset_id", 0)))
-            packed["sensor_type_id"].append(int(meta.get("sensor_type_id", 0)))
-            packed["physical_location_id"].append(int(meta.get("physical_location_id", 0)))
-            packed["hour"].append(int(meta.get("hour", 0)))
-            packed["day_of_week"].append(int(meta.get("day_of_week", 0)))
-            packed["month"].append(int(meta.get("month", 1)))
-            packed["week_of_year"].append(int(meta.get("week_of_year", 1)))
-            packed["season_id"].append(int(meta.get("season_id", 0)))
-            packed["is_holiday"].append(int(meta.get("is_holiday", 0)))
-            packed["peak_status_id"].append(int(meta.get("peak_status_id", 0)))
-            packed["regime_id"].append(int(meta.get("regime_id", meta.get("peak_status_id", 0))))
-            packed["event_id"].append(int(meta.get("event_id", 0)))
-            packed["trend_state_id"].append(int(meta.get("trend_state_id", 1)))
-            packed["volatility_state_id"].append(int(meta.get("volatility_state_id", 1)))
-            packed["shape_state_id"].append(int(meta.get("shape_state_id", 1)))
-            packed["reliability_id"].append(int(meta.get("reliability_id", 1)))
-            packed["month_end_flag"].append(int(meta.get("month_end_flag", 0)))
-
-            local_state = meta.get("local_state_by_period", np.zeros((3, 4), dtype=np.float32))
-            local_state = np.asarray(local_state, dtype=np.float32)
-            if local_state.ndim == 1:
-                local_state = local_state.reshape(1, -1)
-            if local_state.shape[0] < 3:
-                pad = np.zeros((3 - local_state.shape[0], local_state.shape[1]), dtype=np.float32)
-                local_state = np.concatenate([local_state, pad], axis=0)
-            local_state_list.append(local_state[:3, :4])
-
-            exogenous = np.asarray(meta.get("exogenous_vars", np.zeros((8,), dtype=np.float32)), dtype=np.float32).reshape(-1)
-            if exogenous.shape[0] < 8:
-                exogenous = np.concatenate([exogenous, np.zeros((8 - exogenous.shape[0],), dtype=np.float32)], axis=0)
-            exogenous_list.append(exogenous[:8])
-
-        out = {k: torch.tensor(v, dtype=torch.long) for k, v in packed.items()}
-        out["local_state_by_period"] = torch.tensor(np.stack(local_state_list, axis=0), dtype=torch.float32)
-        out["exogenous_vars"] = torch.tensor(np.stack(exogenous_list, axis=0), dtype=torch.float32)
-        return out
-
-    def _meta_from_batch(self, meta_data, bsz):
-        if meta_data is None:
-            empty_records = [{} for _ in range(bsz)]
-            return self._meta_from_records(empty_records)
-
-        if isinstance(meta_data, dict):
-            out = {}
-            key_defaults = {
-                "dataset_id": 0,
-                "sensor_type_id": 0,
-                "physical_location_id": 0,
-                "hour": 0,
-                "day_of_week": 0,
-                "month": 1,
-                "week_of_year": 1,
-                "season_id": 0,
-                "is_holiday": 0,
-                "peak_status_id": 0,
-                "regime_id": 0,
-                "event_id": 0,
-                "trend_state_id": 1,
-                "volatility_state_id": 1,
-                "shape_state_id": 1,
-                "reliability_id": 1,
-                "month_end_flag": 0,
-            }
-            for key in [
-                "dataset_id",
-                "sensor_type_id",
-                "physical_location_id",
-                "hour",
-                "day_of_week",
-                "month",
-                "week_of_year",
-                "season_id",
-                "is_holiday",
-                "peak_status_id",
-                "regime_id",
-                "event_id",
-                "trend_state_id",
-                "volatility_state_id",
-                "shape_state_id",
-                "reliability_id",
-                "month_end_flag",
-            ]:
-                value = meta_data.get(key, key_defaults[key])
-                value = self._to_tensor(value, dtype=torch.float32).long()
-                if value.dim() == 0:
-                    value = value.unsqueeze(0)
-                if value.shape[0] == 1 and bsz > 1:
-                    value = value.repeat(bsz)
-                if value.shape[0] > bsz:
-                    value = value[:bsz]
-                if value.shape[0] < bsz:
-                    pad = torch.zeros((bsz - value.shape[0],), dtype=value.dtype)
-                    value = torch.cat([value, pad], dim=0)
-                out[key] = value
-
-            local_state = meta_data.get("local_state_by_period", torch.zeros((bsz, 3, 4)))
-            local_state = self._to_tensor(local_state, dtype=torch.float32)
-            if local_state.dim() == 2:
-                local_state = local_state.unsqueeze(0)
-            if local_state.shape[0] == 1 and bsz > 1:
-                local_state = local_state.repeat(bsz, 1, 1)
-            if local_state.shape[0] > bsz:
-                local_state = local_state[:bsz]
-            if local_state.shape[0] < bsz:
-                pad = torch.zeros((bsz - local_state.shape[0], local_state.shape[1], local_state.shape[2]))
-                local_state = torch.cat([local_state, pad], dim=0)
-            out["local_state_by_period"] = local_state[:, :3, :4]
-
-            exogenous = meta_data.get("exogenous_vars", torch.zeros((bsz, 8)))
-            exogenous = self._to_tensor(exogenous, dtype=torch.float32)
-            if exogenous.dim() == 1:
-                exogenous = exogenous.unsqueeze(0)
-            if exogenous.shape[0] == 1 and bsz > 1:
-                exogenous = exogenous.repeat(bsz, 1)
-            if exogenous.shape[0] > bsz:
-                exogenous = exogenous[:bsz]
-            if exogenous.shape[0] < bsz:
-                pad = torch.zeros((bsz - exogenous.shape[0], exogenous.shape[1]))
-                exogenous = torch.cat([exogenous, pad], dim=0)
-            if exogenous.shape[1] < 8:
-                pad = torch.zeros((exogenous.shape[0], 8 - exogenous.shape[1]))
-                exogenous = torch.cat([exogenous, pad], dim=1)
-            out["exogenous_vars"] = exogenous[:, :8]
-            return out
-
-        if isinstance(meta_data, list):
-            return self._meta_from_records(meta_data)
-
-        empty_records = [{} for _ in range(bsz)]
-        return self._meta_from_records(empty_records)
-
-    def _normalize_local_state(self, local_state):
-        if self.local_state_mean is None or self.local_state_std is None:
-            return local_state
-        mean = self.local_state_mean.to(local_state.device)
-        std = self.local_state_std.to(local_state.device)
-        return (local_state - mean) / std
-
-    def _normalize_exogenous(self, exogenous):
-        if self.exogenous_mean is None or self.exogenous_std is None:
-            return exogenous
-        mean = self.exogenous_mean.to(exogenous.device)
-        std = self.exogenous_std.to(exogenous.device)
-        return (exogenous - mean) / std
-
-    def _normalize_meta_batch(self, meta_batch, device):
-        norm_batch = {}
-        for key, value in meta_batch.items():
-            if key == "local_state_by_period":
-                v = value.float()
-                v = self._normalize_local_state(v)
-                norm_batch[key] = v.to(device)
-            elif key == "exogenous_vars":
-                v = value.float()
-                v = self._normalize_exogenous(v)
-                norm_batch[key] = v.to(device)
-            else:
-                norm_batch[key] = value.long().to(device)
-        return norm_batch
-
-    def _alpha_value(self, device):
-        if self.learnable_alpha:
-            return torch.sigmoid(self.alpha_logit).to(device)
-        return self.alpha_const.to(device)
-
-    def _encode_query_context(self, meta_query, bsz, device, require_grad=False):
-        query_meta = self._meta_from_batch(meta_query, bsz)
-        query_meta = self._normalize_meta_batch(query_meta, device=device)
-
-        self.context_encoder.to(device)
-        if require_grad and self.train_context_encoder:
-            return self.context_encoder(query_meta)  # [G, B, D]
-        with torch.no_grad():
-            return self.context_encoder(query_meta)  # [G, B, D]
-
-    def _gather_candidate_context(self, candidate_idx, device):
-        if self.meta_pool_context is None:
-            raise RuntimeError("Context pool is empty. Call prepare_dataset() before retrieval.")
-
-        pool_ctx = self.meta_pool_context.to(device)  # [G, T, D]
-        if candidate_idx.dim() == 3:
-            # candidate_idx: [G, B, K] -> [G, B, K, D]
-            gathered = []
-            for g in range(candidate_idx.shape[0]):
-                gathered.append(pool_ctx[g][candidate_idx[g]])
-            return torch.stack(gathered, dim=0)
-
-        if candidate_idx.dim() == 4:
-            # candidate_idx: [G, B, C, K] -> [G, B, C, K, D]
-            gathered = []
-            for g in range(candidate_idx.shape[0]):
-                gathered.append(pool_ctx[g][candidate_idx[g]])
-            return torch.stack(gathered, dim=0)
-
-        raise ValueError(f"Unsupported candidate_idx dim={candidate_idx.dim()}, expected 3 or 4.")
-
-    def refresh_context_pool(self, device=torch.device("cpu")):
-        if self.train_meta_all is None:
-            return
-
-        was_training = self.context_encoder.training
-        self.context_encoder.to(device)
-        self.context_encoder.eval()
-        with torch.no_grad():
-            train_meta = self._normalize_meta_batch(self.train_meta_all, device=device)
-            self.meta_pool_context = self.context_encoder(train_meta).detach().to(device)  # [G, T, D]
-
-        if was_training:
-            self.context_encoder.train()
-
     def prepare_dataset(self, train_data, cache_device=torch.device("cpu")):
         train_data_all = []
         y_data_all = []
-        meta_records = []
 
         # Decide low-memory mode before collecting candidate banks.
         self.low_mem_stream = bool(
@@ -462,8 +72,6 @@ class RetrievalTool(nn.Module):
                     y_data_all.append(td[2][-(train_data.pred_len + train_data.label_len) :])
                 else:
                     y_data_all.append(td[2][-train_data.pred_len :])
-
-            meta_records.append(td[5] if len(td) > 5 else {})
 
         self.n_train = len(train_data_all)
         if self.low_mem_stream:
@@ -491,21 +99,6 @@ class RetrievalTool(nn.Module):
             self.y_data_all = None
             self.train_series_x = None
             self.train_series_y = None
-
-        self.train_meta_all = self._meta_from_records(meta_records)
-        self.train_meta_all = {k: v.to(cache_device) for k, v in self.train_meta_all.items()}
-        local_state = self.train_meta_all["local_state_by_period"].float()  # [T, 3, 4]
-        self.local_state_mean = local_state.mean(dim=0, keepdim=True)
-        self.local_state_std = local_state.std(dim=0, keepdim=True) + 1e-6
-        exogenous = self.train_meta_all["exogenous_vars"].float()  # [T, 8]
-        self.exogenous_mean = exogenous.mean(dim=0, keepdim=True)
-        self.exogenous_std = exogenous.std(dim=0, keepdim=True) + 1e-6
-
-        self.refresh_context_pool(device=cache_device)
-        if self.train_context_encoder:
-            self.context_encoder.train()
-        else:
-            self.context_encoder.eval()
 
     def decompose_mg(self, data_all, remove_offset=True):
         mg = []
@@ -679,16 +272,6 @@ class RetrievalTool(nn.Module):
 
         return torch.cat(sim, dim=3)
 
-    def context_similarity(self, query_ctx, candidate_ctx):
-        cand_norm = F.normalize(candidate_ctx, dim=-1)
-        if candidate_ctx.dim() == 4:
-            query_norm = F.normalize(query_ctx, dim=-1).unsqueeze(2)  # [G, B, 1, D]
-            return (query_norm * cand_norm).sum(dim=-1)  # [G, B, K]
-        if candidate_ctx.dim() == 5:
-            query_norm = F.normalize(query_ctx, dim=-1).unsqueeze(2).unsqueeze(3)  # [G, B, 1, 1, D]
-            return (query_norm * cand_norm).sum(dim=-1)  # [G, B, C, K]
-        raise ValueError(f"Unsupported candidate_ctx dim={candidate_ctx.dim()}, expected 4 or 5.")
-
     def reset_retrieval_compare_stats(self):
         self.compare_stat_calls = 0
         self.compare_overlap_sum = 0.0
@@ -769,12 +352,11 @@ class RetrievalTool(nn.Module):
         self_mask = self_mask.unsqueeze(0).repeat(self.n_period, 1, 1)
         return self_mask.bool()
 
-    def _compute_wave_and_meta_topm(self, x, index, meta_query=None, train=True, require_grad=False, force_wave=False):
+    def _compute_wave_and_meta_topm(self, x, index, train=True, force_wave=False):
         bsz, seq_len, channels = x.shape
         assert seq_len == self.seq_len and channels == self.channels
         select_k = min(self.topm, self.n_train)
 
-        query_ctx = self._encode_query_context(meta_query, bsz, x.device, require_grad=require_grad)  # [G, B, D]
         self_mask = None
         if train:
             self_mask = self._build_train_self_mask(index, bsz, x.device)  # [G, B, T]
@@ -786,37 +368,38 @@ class RetrievalTool(nn.Module):
         need_wave = force_wave or (not self.meta_only_retrieval) or self.compare_retrieval_topk
         sim_wave, wave_idx, wave_score = None, None, None
         if need_wave:
+            # RAFT-origin style wave retrieval: block-wise similarity on flattened
+            # multivariate windows (S*C), i.e. one shared top-m set per sample.
+            x_wave = x_mg.flatten(start_dim=2)  # [G, B, S*C]
             if self.train_data_all_mg is not None:
-                sim_wave = self.periodic_batch_corr_channelwise(
-                    self.train_data_all_mg,  # [G, T, S, C]
-                    x_mg,  # [G, B, S, C]
-                )  # [G, B, C, T]
+                bank_wave = self.train_data_all_mg.flatten(start_dim=2)  # [G, T, S*C]
+                sim_wave = self.periodic_batch_corr(
+                    bank_wave,
+                    x_wave,
+                )  # [G, B, T]
             else:
-                sim_wave = self.periodic_batch_corr_stream_channelwise(
-                    x_mg,
+                sim_wave = self.periodic_batch_corr_stream(
+                    x_wave,
                     in_bsz=self.stream_batch_size,
-                )  # [G, B, C, T]
+                )  # [G, B, T]
             if self_mask is not None:
-                sim_wave = sim_wave.masked_fill(self_mask.unsqueeze(2), float("-inf"))
-            wave_score, wave_idx = torch.topk(sim_wave, select_k, dim=3)  # [G, B, C, k]
+                sim_wave = sim_wave.masked_fill(self_mask, float("-inf"))
+            wave_score, wave_idx = torch.topk(sim_wave, select_k, dim=2)  # [G, B, k]
+            # Keep channel axis for compatibility with current downstream path.
+            wave_score = wave_score.unsqueeze(2).expand(-1, -1, channels, -1)  # [G, B, C, k]
+            wave_idx = wave_idx.unsqueeze(2).expand(-1, -1, channels, -1)  # [G, B, C, k]
 
         # Meta-context-only top-m.
-        pool_ctx = self.meta_pool_context.to(x.device)  # [G, T, D]
-        query_norm = F.normalize(query_ctx, dim=-1)  # [G, B, D]
-        pool_norm = F.normalize(pool_ctx, dim=-1)  # [G, T, D]
-        full_context = torch.bmm(query_norm, pool_norm.transpose(1, 2))  # [G, B, T]
         channel_context = self._meta_channel_similarity(
             query_channel_state,
             self_mask=self_mask,
             in_bsz=self.stream_batch_size,
         )  # [G, B, C, T]
-        # Fuse global meta context + channel-local meta state.
-        meta_sim = channel_context + full_context.unsqueeze(2)  # [G, B, C, T]
+        meta_sim = channel_context
         meta_score, meta_idx = torch.topk(meta_sim, select_k, dim=3)  # [G, B, C, k]
 
         return {
             "select_k": select_k,
-            "query_ctx": query_ctx,
             "wave_idx": wave_idx,
             "wave_score": wave_score,
             "meta_idx": meta_idx,
@@ -877,9 +460,7 @@ class RetrievalTool(nn.Module):
         out = self._compute_wave_and_meta_topm(
             x=x,
             index=index,
-            meta_query=meta_query,
             train=train,
-            require_grad=False,
             force_wave=True,
         )
         wave_idx = out["wave_idx"]
@@ -923,17 +504,13 @@ class RetrievalTool(nn.Module):
         assert seq_len == self.seq_len and channels == self.channels
         index = index.to(x.device)
 
-        require_grad = train and self.train_context_encoder and torch.is_grad_enabled()
         out = self._compute_wave_and_meta_topm(
             x=x,
             index=index,
-            meta_query=meta_query,
             train=train,
-            require_grad=require_grad,
             force_wave=False,
         )
         select_k = int(out["select_k"])
-        query_ctx = out["query_ctx"]
         wave_idx = out["wave_idx"]
         wave_score = out["wave_score"]
         meta_idx = out["meta_idx"]
@@ -943,40 +520,15 @@ class RetrievalTool(nn.Module):
         if self.compare_retrieval_topk and wave_idx is not None:
             self._update_retrieval_compare_stats(wave_idx, meta_idx)
 
-        # Choose retrieval candidate source.
         if self.meta_only_retrieval:
             selected_global_idx = meta_idx
-            selected_context = meta_score
-            selected_wave = torch.zeros_like(selected_context)
+            base_score = meta_score
         else:
             if wave_idx is None:
                 raise RuntimeError("Waveform similarity is unavailable for waveform-only retrieval.")
             selected_global_idx = wave_idx
-            selected_wave = wave_score
-
-        selected_ctx = self._gather_candidate_context(selected_global_idx, x.device)  # [G, B, C, k, D] or [G, B, k, D]
-        if not self.meta_only_retrieval:
-            selected_context = self.context_similarity(query_ctx, selected_ctx)  # [G, B, C, k] or [G, B, k]
-
-        if self.use_gated_aggregation:
-            if selected_ctx.dim() == 5:
-                query_expand = query_ctx.unsqueeze(2).unsqueeze(3).expand(-1, -1, channels, select_k, -1)  # [G, B, C, k, D]
-            else:
-                query_expand = query_ctx.unsqueeze(2).expand(-1, -1, select_k, -1)  # [G, B, k, D]
-            gate_input = torch.cat(
-                [
-                    query_expand,
-                    selected_ctx,
-                    selected_wave.unsqueeze(-1),
-                    selected_context.unsqueeze(-1),
-                ],
-                dim=-1,
-            )
-            gate_logits = self.candidate_gate(gate_input).squeeze(-1)
-            ranking_prob = F.softmax(gate_logits, dim=-1)
-        else:
-            base_score = selected_context if self.meta_only_retrieval else selected_wave
-            ranking_prob = F.softmax(base_score / self.temperature, dim=-1)
+            base_score = wave_score
+        ranking_prob = F.softmax(base_score / self.temperature, dim=-1)
 
         if self.y_data_all_mg is not None:
             y_bank = self.y_data_all_mg.to(x.device).float()  # [G, T, P, C]
@@ -1067,3 +619,147 @@ class RetrievalTool(nn.Module):
 
         retrievals = torch.cat(retrievals, dim=1)
         return retrievals
+
+    @torch.no_grad()
+    def evaluate_wave_meta_retrieval_quality(self, data, device=torch.device("cpu"), train=False):
+        """
+        Quantify retrieval-only future quality over a full split.
+        Compare wave-retrieved future vs meta-retrieved future against true future
+        in the same multi-scale decomposition space.
+        """
+        loader = DataLoader(
+            data,
+            batch_size=512,
+            shuffle=False,
+            num_workers=0 if self.low_mem_stream else 4,
+            drop_last=False,
+        )
+
+        wave_sq_sum = 0.0
+        wave_abs_sum = 0.0
+        meta_sq_sum = 0.0
+        meta_abs_sum = 0.0
+        n_elem_total = 0
+
+        g_count = len(self.period_num)
+        channel_count = int(self.channels)
+        wave_sq_by_g = np.zeros((g_count,), dtype=np.float64)
+        wave_abs_by_g = np.zeros((g_count,), dtype=np.float64)
+        meta_sq_by_g = np.zeros((g_count,), dtype=np.float64)
+        meta_abs_by_g = np.zeros((g_count,), dtype=np.float64)
+        n_elem_by_g = np.zeros((g_count,), dtype=np.float64)
+        wave_sq_by_c = np.zeros((channel_count,), dtype=np.float64)
+        wave_abs_by_c = np.zeros((channel_count,), dtype=np.float64)
+        meta_sq_by_c = np.zeros((channel_count,), dtype=np.float64)
+        meta_abs_by_c = np.zeros((channel_count,), dtype=np.float64)
+        n_elem_by_c = np.zeros((channel_count,), dtype=np.float64)
+
+        original_meta_only = bool(self.meta_only_retrieval)
+
+        for batch in tqdm(loader):
+            index, batch_x, batch_y = batch[0], batch[1], batch[2]
+            meta_data = batch[5] if len(batch) > 5 else None
+
+            batch_x = batch_x.float().to(device)
+            batch_y_future = batch_y[:, -self.pred_len :, :].float().to(device)
+            true_mg, _ = self.decompose_mg(batch_y_future)  # [G, B, P, C]
+
+            self.meta_only_retrieval = False
+            wave_pred = self.retrieve(
+                batch_x,
+                index,
+                meta_query=meta_data,
+                train=train,
+            )  # [G, B, P, C]
+
+            self.meta_only_retrieval = True
+            meta_pred = self.retrieve(
+                batch_x,
+                index,
+                meta_query=meta_data,
+                train=train,
+            )  # [G, B, P, C]
+
+            wave_err = wave_pred - true_mg
+            meta_err = meta_pred - true_mg
+
+            wave_sq_sum += float((wave_err ** 2).sum().item())
+            wave_abs_sum += float(torch.abs(wave_err).sum().item())
+            meta_sq_sum += float((meta_err ** 2).sum().item())
+            meta_abs_sum += float(torch.abs(meta_err).sum().item())
+            n_elem_total += int(wave_err.numel())
+
+            wave_sq_by_c += (wave_err ** 2).sum(dim=(0, 1, 2)).detach().cpu().numpy()
+            wave_abs_by_c += torch.abs(wave_err).sum(dim=(0, 1, 2)).detach().cpu().numpy()
+            meta_sq_by_c += (meta_err ** 2).sum(dim=(0, 1, 2)).detach().cpu().numpy()
+            meta_abs_by_c += torch.abs(meta_err).sum(dim=(0, 1, 2)).detach().cpu().numpy()
+            n_elem_by_c += np.full((channel_count,), wave_err.shape[0] * wave_err.shape[1] * wave_err.shape[2], dtype=np.float64)
+
+            for g_i in range(g_count):
+                we = wave_err[g_i]
+                me = meta_err[g_i]
+                wave_sq_by_g[g_i] += float((we ** 2).sum().item())
+                wave_abs_by_g[g_i] += float(torch.abs(we).sum().item())
+                meta_sq_by_g[g_i] += float((me ** 2).sum().item())
+                meta_abs_by_g[g_i] += float(torch.abs(me).sum().item())
+                n_elem_by_g[g_i] += float(we.numel())
+
+        self.meta_only_retrieval = original_meta_only
+
+        if n_elem_total <= 0:
+            return None
+
+        wave_mse = wave_sq_sum / n_elem_total
+        wave_mae = wave_abs_sum / n_elem_total
+        meta_mse = meta_sq_sum / n_elem_total
+        meta_mae = meta_abs_sum / n_elem_total
+
+        per_period = []
+        for g_i, g in enumerate(self.period_num):
+            denom = max(n_elem_by_g[g_i], 1.0)
+            per_period.append(
+                {
+                    "period_idx": int(g_i),
+                    "period_g": int(g),
+                    "wave_mse": float(wave_sq_by_g[g_i] / denom),
+                    "wave_mae": float(wave_abs_by_g[g_i] / denom),
+                    "meta_mse": float(meta_sq_by_g[g_i] / denom),
+                    "meta_mae": float(meta_abs_by_g[g_i] / denom),
+                }
+            )
+
+        feature_names = getattr(data, "feature_names", None)
+        if feature_names is None or len(feature_names) != channel_count:
+            feature_names = [f"channel_{i}" for i in range(channel_count)]
+
+        per_channel = []
+        for c_i, name in enumerate(feature_names):
+            denom = max(n_elem_by_c[c_i], 1.0)
+            wave_mse_c = float(wave_sq_by_c[c_i] / denom)
+            meta_mse_c = float(meta_sq_by_c[c_i] / denom)
+            wave_mae_c = float(wave_abs_by_c[c_i] / denom)
+            meta_mae_c = float(meta_abs_by_c[c_i] / denom)
+            per_channel.append(
+                {
+                    "channel_idx": int(c_i),
+                    "channel_name": str(name),
+                    "wave_mse": wave_mse_c,
+                    "wave_mae": wave_mae_c,
+                    "meta_mse": meta_mse_c,
+                    "meta_mae": meta_mae_c,
+                    "delta_mse_meta_minus_wave": float(meta_mse_c - wave_mse_c),
+                    "delta_mae_meta_minus_wave": float(meta_mae_c - wave_mae_c),
+                }
+            )
+
+        return {
+            "split": "train" if train else "eval",
+            "wave_mse": float(wave_mse),
+            "wave_mae": float(wave_mae),
+            "meta_mse": float(meta_mse),
+            "meta_mae": float(meta_mae),
+            "delta_mse_meta_minus_wave": float(meta_mse - wave_mse),
+            "delta_mae_meta_minus_wave": float(meta_mae - wave_mae),
+            "per_period": per_period,
+            "per_channel": per_channel,
+        }

@@ -17,7 +17,7 @@ warnings.filterwarnings('ignore')
 
 
 def _compact_numeric_meta(meta_data):
-    """Keep only retrieval-required numeric fields for safe DataLoader collation."""
+    """Keep only the local periodic state used by the current model path."""
     local_state = np.asarray(meta_data.get("local_state_by_period", np.zeros((3, 4), dtype=np.float32)), dtype=np.float32)
     if local_state.ndim == 1:
         local_state = local_state.reshape(1, -1)
@@ -29,18 +29,7 @@ def _compact_numeric_meta(meta_data):
         local_state = np.concatenate([local_state, pad], axis=1)
     local_state = local_state[:3, :4].astype(np.float32)
 
-    compact = {
-        "dataset_id": int(meta_data.get("dataset_id", 0)),
-        "sensor_type_id": int(meta_data.get("sensor_type_id", 0)),
-        "physical_location_id": int(meta_data.get("physical_location_id", 0)),
-        "hour": int(meta_data.get("hour", 0)),
-        "day_of_week": int(meta_data.get("day_of_week", 0)),
-        "month": int(meta_data.get("month", 1)),
-        "is_holiday": int(meta_data.get("is_holiday", 0)),
-        "peak_status_id": int(meta_data.get("peak_status_id", 0)),
-        "local_state_by_period": local_state,
-    }
-    return compact
+    return {"local_state_by_period": local_state}
 
 
 def build_sample_meta(dataset, index, seq_x):

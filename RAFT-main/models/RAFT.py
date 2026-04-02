@@ -14,9 +14,7 @@ class Model(nn.Module):
         self.channels = configs.enc_in
 
         self.retrieval_cache_device = getattr(configs, "retrieval_cache_device", "gpu")
-        self.learnable_alpha = getattr(configs, "learnable_alpha", False)
-        self.online_retrieval = getattr(configs, "online_retrieval", False) or self.learnable_alpha
-        self.refresh_context_each_epoch = getattr(configs, "refresh_context_each_epoch", True)
+        self.compare_retrieval_future_quality = bool(getattr(configs, "compare_retrieval_future_quality", False))
         if self.retrieval_cache_device == "gpu" and not torch.cuda.is_available():
             self.retrieval_cache_device = "cpu"
 
@@ -30,23 +28,14 @@ class Model(nn.Module):
             pred_len=self.pred_len,
             channels=self.channels,
             n_period=self.n_period,
+            temperature=getattr(configs, "retrieval_temperature", 0.1),
             topm=self.topm,
-            alpha=getattr(configs, "retrieval_alpha", 0.7),
-            coarse_k=getattr(configs, "retrieval_coarse_k", 80),
-            context_dim=getattr(configs, "context_dim", getattr(configs, "meta_embed_dim", 64)),
-            gate_hidden_dim=getattr(configs, "gate_hidden_dim", 128),
-            use_gated_aggregation=getattr(configs, "use_gated_aggregation", True),
-            learnable_alpha=getattr(configs, "learnable_alpha", False),
-            train_context_encoder=not getattr(configs, "freeze_context_encoder", False),
             meta_only_retrieval=getattr(configs, "meta_only_retrieval", False),
-            compare_retrieval_topk=getattr(
-                configs,
-                "compare_retrieval_topm",
-                getattr(configs, "compare_retrieval_topk", False),
-            ),
+            compare_retrieval_topk=getattr(configs, "compare_retrieval_topm", False),
         )
 
         self.period_num = self.rt.period_num[-1 * self.n_period:]
+        self.retrieval_future_quality = None
         self.retrieval_pred = nn.ModuleList(
             [nn.Linear(self.pred_len // g, self.pred_len) for g in self.period_num]
         )
@@ -71,58 +60,36 @@ class Model(nn.Module):
         self.retrieval_dict = {}
         retrieval_cache_device = self._resolve_cache_device(self.retrieval_cache_device)
 
-        if self.online_retrieval:
-            print("Preparing Online Retrieval Bank")
-            self.rt.prepare_dataset(train_data, cache_device=retrieval_cache_device)
-        else:
-            self.rt.prepare_dataset(train_data, cache_device=retrieval_cache_device)
+        self.rt.prepare_dataset(train_data, cache_device=retrieval_cache_device)
 
-            print("Doing Train Retrieval")
-            train_rt = self.rt.retrieve_all(train_data, train=True, device=self.device)
+        print("Doing Train Retrieval")
+        train_rt = self.rt.retrieve_all(train_data, train=True, device=self.device)
 
-            print("Doing Valid Retrieval")
-            valid_rt = self.rt.retrieve_all(valid_data, train=False, device=self.device)
+        print("Doing Valid Retrieval")
+        valid_rt = self.rt.retrieve_all(valid_data, train=False, device=self.device)
 
-            print("Doing Test Retrieval")
-            test_rt = self.rt.retrieve_all(test_data, train=False, device=self.device)
+        print("Doing Test Retrieval")
+        test_rt = self.rt.retrieve_all(test_data, train=False, device=self.device)
 
-        if not self.online_retrieval:
-            self.retrieval_dict["train"] = train_rt.detach().to(retrieval_cache_device)
-            self.retrieval_dict["valid"] = valid_rt.detach().to(retrieval_cache_device)
-            self.retrieval_dict["test"] = test_rt.detach().to(retrieval_cache_device)
+        if self.compare_retrieval_future_quality:
+            print("Evaluating retrieval-only future quality (wave vs meta) on test split")
+            self.retrieval_future_quality = self.rt.evaluate_wave_meta_retrieval_quality(
+                data=test_data,
+                device=self.device,
+                train=False,
+            )
 
-        if not self.online_retrieval:
-            del self.rt
+        self.retrieval_dict["train"] = train_rt.detach().to(retrieval_cache_device)
+        self.retrieval_dict["valid"] = valid_rt.detach().to(retrieval_cache_device)
+        self.retrieval_dict["test"] = test_rt.detach().to(retrieval_cache_device)
+
+        del self.rt
         torch.cuda.empty_cache()
 
-    def refresh_retrieval_bank(self):
-        if not self.online_retrieval or not self.refresh_context_each_epoch:
-            return
-        if not hasattr(self, "rt"):
-            return
-        refresh_device = self._resolve_cache_device(self.retrieval_cache_device)
-        self.rt.refresh_context_pool(device=refresh_device)
-
-    def reset_retrieval_compare_stats(self):
-        if not self.online_retrieval:
-            return
-        if not hasattr(self, "rt"):
-            return
-        if hasattr(self.rt, "reset_retrieval_compare_stats"):
-            self.rt.reset_retrieval_compare_stats()
-
-    def get_retrieval_compare_stats(self):
-        if not self.online_retrieval:
-            return None
-        if not hasattr(self, "rt"):
-            return None
-        if hasattr(self.rt, "get_retrieval_compare_stats"):
-            return self.rt.get_retrieval_compare_stats()
-        return None
+    def get_retrieval_future_quality(self):
+        return self.retrieval_future_quality
 
     def export_wave_meta_topm_case(self, x, index, meta_data=None, sample_idx=0, period_idx=-1, channel_idx=-1, train=False):
-        if not self.online_retrieval:
-            return None
         if not hasattr(self, "rt"):
             return None
         if not hasattr(self.rt, "export_wave_meta_topm_case"):
@@ -180,18 +147,9 @@ class Model(nn.Module):
 
         x_pred_from_x = self.linear_x(x_norm.permute(0, 2, 1)).permute(0, 2, 1)  # B, P, C
 
-        if self.online_retrieval:
-            use_train_mask = mode == "train"
-            pred_from_retrieval = self.rt.retrieve(
-                x,
-                index,
-                meta_query=meta_data,
-                train=use_train_mask,
-            ).to(self.device)  # G, B, P, C
-        else:
-            retrieval_bank = self.retrieval_dict[mode]
-            retrieval_index = index.long().to(retrieval_bank.device)
-            pred_from_retrieval = retrieval_bank[:, retrieval_index].to(self.device)  # G, B, P, C
+        retrieval_bank = self.retrieval_dict[mode]
+        retrieval_index = index.long().to(retrieval_bank.device)
+        pred_from_retrieval = retrieval_bank[:, retrieval_index].to(self.device)  # G, B, P, C
 
         retrieval_pred_list = []
         numeric_feature = x_pred_from_x.permute(0, 2, 1)  # B, C, P

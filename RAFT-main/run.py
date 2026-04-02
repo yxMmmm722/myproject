@@ -133,37 +133,16 @@ if __name__ == '__main__':
         '--topm', type=int, default=20,
         help='Number of Retrievals'
     )
-    parser.add_argument('--retrieval_alpha', type=float, default=0.7,
-                        help='fused retrieval score weight for numerical similarity')
     parser.add_argument('--retrieval_temperature', type=float, default=0.1,
                         help='softmax temperature for retrieval candidate weighting')
-    parser.add_argument('--learnable_alpha', action='store_true',
-                        help='use learnable alpha for retrieval fusion')
-    parser.add_argument('--online_retrieval', action='store_true',
-                        help='compute retrieval online instead of using precomputed cache')
-    parser.add_argument('--retrieval_coarse_k', type=int, default=80,
-                        help='coarse retrieval top-k using waveform similarity')
     parser.add_argument('--meta_only_retrieval', action='store_true',
                         help='use one-shot meta-context retrieval only (disable two-stage retrieval)')
     parser.add_argument('--compare_retrieval_topm', action='store_true',
                         help='compare top-m overlap between waveform-only retrieval and meta-only retrieval')
-    parser.add_argument('--compare_retrieval_topk', action='store_true', help=argparse.SUPPRESS)
-    parser.add_argument('--context_dim', type=int, default=64,
-                        help='context encoder hidden dimension')
-    parser.add_argument('--gate_hidden_dim', type=int, default=128,
-                        help='hidden dim of candidate gate in retrieval aggregation')
+    parser.add_argument('--compare_retrieval_future_quality', action='store_true',
+                        help='evaluate retrieval-only future quality on full split: wave vs meta')
     parser.add_argument('--period_router_hidden_dim', type=int, default=128,
                         help='hidden dim of query-adaptive period fusion router')
-    parser.add_argument('--no_gated_aggregation', action='store_true',
-                        help='disable gated candidate aggregation and fallback to context-softmax weighting')
-    parser.add_argument('--freeze_context_encoder', action='store_true',
-                        help='freeze context encoder and only train alpha/predictor')
-    parser.add_argument('--no_refresh_context_each_epoch', action='store_true',
-                        help='disable refreshing context pool every training epoch (online retrieval only)')
-    parser.add_argument('--meta_hidden_dim', type=int, default=128,
-                        help='hidden dim of meta context encoder')
-    parser.add_argument('--meta_embed_dim', type=int, default=64,
-                        help='output dim of meta context encoder')
     parser.add_argument('--save_retrieval_cases', action='store_true',
                         help='save wave/meta top-m case plots in test stage')
     parser.add_argument('--retrieval_case_period_idx', type=int, default=-1,
@@ -233,10 +212,6 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     apply_data_preset(args)
-    args.compare_retrieval_topk = bool(args.compare_retrieval_topm or args.compare_retrieval_topk)
-    args.compare_retrieval_topm = args.compare_retrieval_topk
-    args.refresh_context_each_epoch = not args.no_refresh_context_each_epoch
-    args.use_gated_aggregation = not args.no_gated_aggregation
     # args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
     args.use_gpu = True if torch.cuda.is_available() else False
 

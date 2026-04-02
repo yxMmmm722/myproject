@@ -32,50 +32,6 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         return self.model
 
     @staticmethod
-    def _save_retrieval_compare_viz(cmp_stats, out_dir, tag):
-        if cmp_stats is None:
-            return
-        os.makedirs(out_dir, exist_ok=True)
-        m = int(cmp_stats.get("m", 0))
-        if m <= 0:
-            return
-
-        rank_ratio = np.asarray(cmp_stats.get("rank_match_ratio", [])[:m], dtype=np.float32)
-        overlap_hist = np.asarray(cmp_stats.get("overlap_hist_ratio", [])[: m + 1], dtype=np.float32)
-
-        np.save(os.path.join(out_dir, f"{tag}_rank_match_ratio.npy"), rank_ratio)
-        np.save(os.path.join(out_dir, f"{tag}_overlap_hist_ratio.npy"), overlap_hist)
-        with open(os.path.join(out_dir, f"{tag}_summary.json"), "w", encoding="utf-8") as f:
-            json.dump(cmp_stats, f, indent=2, ensure_ascii=False)
-
-        try:
-            import matplotlib.pyplot as plt
-
-            x_rank = np.arange(1, m + 1)
-            plt.figure(figsize=(8, 3.2))
-            plt.bar(x_rank, rank_ratio, color="#2563eb")
-            plt.ylim(0.0, 1.0)
-            plt.xlabel("Rank (1..m)")
-            plt.ylabel("Match Ratio")
-            plt.title(f"Wave vs Meta Rank-Match ({tag})")
-            plt.tight_layout()
-            plt.savefig(os.path.join(out_dir, f"{tag}_rank_match.png"), dpi=150)
-            plt.close()
-
-            x_overlap = np.arange(0, m + 1)
-            plt.figure(figsize=(8, 3.2))
-            plt.bar(x_overlap, overlap_hist, color="#16a34a")
-            plt.ylim(0.0, 1.0)
-            plt.xlabel("Overlap Count in Top-m")
-            plt.ylabel("Frequency Ratio")
-            plt.title(f"Wave vs Meta Top-m Overlap Histogram ({tag})")
-            plt.tight_layout()
-            plt.savefig(os.path.join(out_dir, f"{tag}_overlap_hist.png"), dpi=150)
-            plt.close()
-        except Exception as e:
-            print(f"[RetrievalCompare] skip plot save due to matplotlib error: {e}")
-
-    @staticmethod
     def _save_retrieval_case_viz(case_data, out_dir, tag):
         if case_data is None:
             return
@@ -349,12 +305,6 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             train_loss = []
 
             self.model.train()
-            if self.args.model == 'RAFT':
-                raft_model = self._raft_model()
-                if hasattr(raft_model, "refresh_retrieval_bank"):
-                    raft_model.refresh_retrieval_bank()
-                if hasattr(raft_model, "reset_retrieval_compare_stats"):
-                    raft_model.reset_retrieval_compare_stats()
 
             epoch_time = time.time()
             for i, batch in enumerate(train_loader):
@@ -422,25 +372,6 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
             print("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f} Test Loss: {4:.7f}".format(
                 epoch + 1, train_steps, train_loss, vali_loss, test_loss))
-            if self.args.model == 'RAFT':
-                raft_model = self._raft_model()
-                if hasattr(raft_model, "get_retrieval_compare_stats"):
-                    cmp_stats = raft_model.get_retrieval_compare_stats()
-                    if cmp_stats is not None:
-                        print(
-                            "[RetrievalCompare][Epoch {}] overlap@m={:.4f}, exact_set={:.4f}, exact_order={:.4f}, calls={}".format(
-                                epoch + 1,
-                                cmp_stats["overlap_ratio"],
-                                cmp_stats["exact_set_ratio"],
-                                cmp_stats["exact_order_ratio"],
-                                cmp_stats["calls"],
-                            )
-                        )
-                        self._save_retrieval_compare_viz(
-                            cmp_stats,
-                            out_dir=os.path.join(path, "retrieval_compare"),
-                            tag=f"epoch_{epoch + 1}",
-                        )
 
             adjust_learning_rate(model_optim, epoch + 1, self.args)
             early_stopping(vali_loss, self.model, path)
@@ -466,7 +397,6 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
         self.model.eval()
         amp_enabled = self.args.use_amp and self.args.use_gpu
-        cmp_stats_test = None
         target_case_batches = {0}
         if bool(getattr(self.args, "retrieval_case_first_last_batches", False)):
             target_case_batches.add(max(len(test_loader) - 1, 0))
@@ -475,8 +405,6 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             raft_model = None
             if self.args.model == 'RAFT':
                 raft_model = self._raft_model()
-                if hasattr(raft_model, "reset_retrieval_compare_stats"):
-                    raft_model.reset_retrieval_compare_stats()
             for i, batch in enumerate(test_loader):
                 index, batch_x, batch_y, batch_x_mark, batch_y_mark, meta_data = self._unpack_batch(batch)
                 batch_x = batch_x.float().to(self.device)
@@ -714,21 +642,6 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                     pd = np.concatenate((input[0, :, -1], pred[0, :, -1]), axis=0)
                     visual(gt, pd, os.path.join(folder_path, str(i) + '.pdf'))
 
-        if self.args.model == 'RAFT':
-            raft_model = self._raft_model()
-            if hasattr(raft_model, "get_retrieval_compare_stats"):
-                cmp_stats = raft_model.get_retrieval_compare_stats()
-                if cmp_stats is not None:
-                    cmp_stats_test = cmp_stats
-                    print(
-                        "[RetrievalCompare][Test] overlap@m={:.4f}, exact_set={:.4f}, exact_order={:.4f}, calls={}".format(
-                            cmp_stats["overlap_ratio"],
-                            cmp_stats["exact_set_ratio"],
-                            cmp_stats["exact_order_ratio"],
-                            cmp_stats["calls"],
-                        )
-                    )
-
         preds = np.concatenate(preds, axis=0)
         trues = np.concatenate(trues, axis=0)
         print('test shape:', preds.shape, trues.shape)
@@ -740,12 +653,29 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         folder_path = './results/' + setting + '/'
         if not os.path.exists(folder_path):
             os.makedirs(folder_path)
-        if cmp_stats_test is not None:
-            self._save_retrieval_compare_viz(
-                cmp_stats_test,
-                out_dir=os.path.join(folder_path, "retrieval_compare"),
-                tag="test",
+
+        retrieval_future_quality = None
+        if self.args.model == 'RAFT':
+            raft_model = self._raft_model()
+            if hasattr(raft_model, "get_retrieval_future_quality"):
+                retrieval_future_quality = raft_model.get_retrieval_future_quality()
+        if retrieval_future_quality is not None:
+            print(
+                "[RetrievalFutureQuality] "
+                f"wave_mse={retrieval_future_quality['wave_mse']:.6f} "
+                f"meta_mse={retrieval_future_quality['meta_mse']:.6f} "
+                f"delta(meta-wave)={retrieval_future_quality['delta_mse_meta_minus_wave']:.6f}"
             )
+            for item in retrieval_future_quality.get("per_channel", []):
+                print(
+                    "[RetrievalFutureQuality][Channel] "
+                    f"{item['channel_name']} "
+                    f"wave_mse={item['wave_mse']:.6f} "
+                    f"meta_mse={item['meta_mse']:.6f} "
+                    f"delta(meta-wave)={item['delta_mse_meta_minus_wave']:.6f}"
+                )
+            with open(os.path.join(folder_path, "retrieval_future_quality.json"), "w", encoding="utf-8") as f:
+                json.dump(retrieval_future_quality, f, indent=2, ensure_ascii=False)
         
         # dtw calculation
         if self.args.use_dtw:

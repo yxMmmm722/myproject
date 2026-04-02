@@ -38,20 +38,10 @@ def print_args(args):
     print(f'  {"Distil:":<20}{args.distil:<20}{"Dropout:":<20}{args.dropout:<20}')
     print(f'  {"Embed:":<20}{args.embed:<20}{"Activation:":<20}{args.activation:<20}')
     print(f'  {"Output Attention:":<20}{args.output_attention:<20}')
-    if hasattr(args, "retrieval_alpha"):
-        print(f'  {"Retr Alpha:":<20}{args.retrieval_alpha:<20}{"Coarse K:":<20}{args.retrieval_coarse_k:<20}')
     if hasattr(args, "meta_only_retrieval"):
         print(f'  {"Meta-Only Retr:":<20}{args.meta_only_retrieval:<20}{"Topm:":<20}{args.topm:<20}')
     if hasattr(args, "compare_retrieval_topm"):
         print(f'  {"Cmp Retr Topm:":<20}{args.compare_retrieval_topm:<20}')
-    elif hasattr(args, "compare_retrieval_topk"):
-        print(f'  {"Cmp Retr Topm:":<20}{args.compare_retrieval_topk:<20}')
-    if hasattr(args, "context_dim"):
-        print(f'  {"Context Dim:":<20}{args.context_dim:<20}{"Learnable Alpha:":<20}{args.learnable_alpha:<20}')
-    if hasattr(args, "freeze_context_encoder"):
-        print(f'  {"Freeze Context:":<20}{args.freeze_context_encoder:<20}{"Refresh Ctx Pool:":<20}{args.refresh_context_each_epoch:<20}')
-    if hasattr(args, "online_retrieval"):
-        print(f'  {"Online Retrieval:":<20}{args.online_retrieval:<20}')
     if hasattr(args, "save_retrieval_cases"):
         print(f'  {"Save Retr Cases:":<20}{args.save_retrieval_cases:<20}{"Case Period Idx:":<20}{args.retrieval_case_period_idx:<20}')
         print(f'  {"Case Channel Idx:":<20}{args.retrieval_case_channel_idx:<20}{"Case Sample Idx:":<20}{args.retrieval_case_sample_idx:<20}')

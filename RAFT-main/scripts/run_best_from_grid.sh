@@ -34,17 +34,12 @@ GRID_PRED_LENS="${GRID_PRED_LENS:-96,192,336,720}"  # used when PRED_LEN is empt
 GRID_LOOKBACK_GRID="${GRID_LOOKBACK_GRID:-}"
 GRID_LEARNING_RATE_GRID="${GRID_LEARNING_RATE_GRID:-}"
 GRID_TOPM_GRID="${GRID_TOPM_GRID:-10,20,40}"
-GRID_COARSE_K_GRID="${GRID_COARSE_K_GRID:-40,80,160}"
 GRID_N_PERIOD_GRID="${GRID_N_PERIOD_GRID:-2,3}"
-GRID_CONTEXT_DIM_GRID="${GRID_CONTEXT_DIM_GRID:-32,64}"
-GRID_RETRIEVAL_ALPHA_GRID="${GRID_RETRIEVAL_ALPHA_GRID:-0.7}"
 GRID_MAX_TRIALS="${GRID_MAX_TRIALS:-0}"
 GRID_MODEL_PREFIX="${GRID_MODEL_PREFIX:-HCARGrid}"
 
 # Optional feature toggles.
 USE_AMP="${USE_AMP:-1}"  # 1 => add --use_amp
-FREEZE_CONTEXT_ENCODER="${FREEZE_CONTEXT_ENCODER:-0}"
-NO_REFRESH_CONTEXT_EACH_EPOCH="${NO_REFRESH_CONTEXT_EACH_EPOCH:-0}"
 RETRIEVAL_CACHE_DEVICE="${RETRIEVAL_CACHE_DEVICE:-gpu}"  # cpu|gpu
 TRAFFIC_CACHE_DEVICE="${TRAFFIC_CACHE_DEVICE:-cpu}"  # cpu|gpu, used only for traffic
 
@@ -94,10 +89,7 @@ if [[ "${FORCE_GRID_SEARCH}" == "1" || -z "${GRID_CSV}" ]]; then
     --selection_metric "${SELECTION_METRIC}"
     --max_trials "${GRID_MAX_TRIALS}"
     --topm_grid "${GRID_TOPM_GRID}"
-    --coarse_k_grid "${GRID_COARSE_K_GRID}"
     --n_period_grid "${GRID_N_PERIOD_GRID}"
-    --context_dim_grid "${GRID_CONTEXT_DIM_GRID}"
-    --retrieval_alpha_grid "${GRID_RETRIEVAL_ALPHA_GRID}"
   )
 
   if [[ -n "${DATASETS}" ]]; then
@@ -111,12 +103,6 @@ if [[ "${FORCE_GRID_SEARCH}" == "1" || -z "${GRID_CSV}" ]]; then
   fi
   if [[ "${USE_AMP}" == "1" ]]; then
     grid_cmd+=(--use_amp)
-  fi
-  if [[ "${FREEZE_CONTEXT_ENCODER}" == "1" ]]; then
-    grid_cmd+=(--freeze_context_encoder)
-  fi
-  if [[ "${NO_REFRESH_CONTEXT_EACH_EPOCH}" == "1" ]]; then
-    grid_cmd+=(--no_refresh_context_each_epoch)
   fi
 
   "${grid_cmd[@]}"
@@ -235,8 +221,7 @@ with open(grid_csv, "r", encoding="utf-8") as f:
 
 for key in sorted(best.keys()):
     row = best[key]
-    # dataset, pred_len, seq_len, learning_rate, topm, coarse_k, n_period, context_dim,
-    # retrieval_alpha, channels, best_score, mse, mae
+    # dataset, pred_len, seq_len, learning_rate, topm, n_period, channels, best_score, mse, mae
     score = score_of(row)
     print(
         "\t".join(
@@ -246,10 +231,7 @@ for key in sorted(best.keys()):
                 row.get("seq_len", "").strip(),
                 row.get("learning_rate", "").strip(),
                 row.get("topm", "").strip(),
-                row.get("coarse_k", "").strip(),
                 row.get("n_period", "").strip(),
-                row.get("context_dim", "").strip(),
-                row.get("retrieval_alpha", "").strip(),
                 row.get("channels", "").strip(),
                 str(score),
                 row.get("mse", "").strip(),
@@ -269,7 +251,7 @@ SUCCESS_RUNS=()
 FAILED_RUNS=()
 SKIPPED_RUNS=()
 
-while IFS=$'\t' read -r dataset pred_len best_seq_len best_learning_rate topm coarse_k n_period context_dim retrieval_alpha channels best_score best_mse best_mae; do
+while IFS=$'\t' read -r dataset pred_len best_seq_len best_learning_rate topm n_period channels best_score best_mse best_mae; do
   root_path="${ROOT_PATHS[${dataset}]:-}"
   data_file="${DATA_FILES[${dataset}]:-}"
   if [[ -z "${root_path}" || -z "${data_file}" ]]; then
@@ -303,13 +285,13 @@ while IFS=$'\t' read -r dataset pred_len best_seq_len best_learning_rate topm co
     retrieval_cache_device_run="${TRAFFIC_CACHE_DEVICE}"
   fi
 
-  model_id="${MODEL_PREFIX}_${dataset}_pl${pred_len}_lb${seq_len_run}_lr${learning_rate_run}_m${topm}_k${coarse_k}_p${n_period}_cd${context_dim}"
+  model_id="${MODEL_PREFIX}_${dataset}_pl${pred_len}_lb${seq_len_run}_lr${learning_rate_run}_m${topm}_p${n_period}"
   log_file="${LOG_DIR}/${model_id}.log"
 
   echo "============================================================"
   echo "[RUN ] dataset=${dataset} pred_len=${pred_len} channels=${channels}"
   echo "[BEST] metric=${SELECTION_METRIC} score=${best_score} mse=${best_mse} mae=${best_mae}"
-  echo "[CFG ] seq_len=${seq_len_run} lr=${learning_rate_run} topm=${topm} coarse_k=${coarse_k} n_period=${n_period} context_dim=${context_dim} retrieval_alpha=${retrieval_alpha} cache=${retrieval_cache_device_run}"
+  echo "[CFG ] seq_len=${seq_len_run} lr=${learning_rate_run} topm=${topm} n_period=${n_period} cache=${retrieval_cache_device_run}"
   echo "[LOG ] ${log_file}"
   echo "============================================================"
 
@@ -323,23 +305,13 @@ while IFS=$'\t' read -r dataset pred_len best_seq_len best_learning_rate topm co
     --seq_len "${seq_len_run}" --label_len "${LABEL_LEN}" --pred_len "${pred_len}"
     --enc_in "${channels}" --dec_in "${channels}" --c_out "${channels}"
     --n_period "${n_period}" --topm "${topm}"
-    --retrieval_coarse_k "${coarse_k}"
-    --retrieval_alpha "${retrieval_alpha}"
-    --context_dim "${context_dim}"
     --retrieval_cache_device "${retrieval_cache_device_run}"
-    --online_retrieval
     --batch_size "${BATCH_SIZE}" --train_epochs "${TRAIN_EPOCHS}"
     --learning_rate "${learning_rate_run}" --lradj cosine --num_workers "${NUM_WORKERS}"
   )
 
   if [[ "${USE_AMP}" == "1" ]]; then
     cmd+=(--use_amp)
-  fi
-  if [[ "${FREEZE_CONTEXT_ENCODER}" == "1" ]]; then
-    cmd+=(--freeze_context_encoder)
-  fi
-  if [[ "${NO_REFRESH_CONTEXT_EACH_EPOCH}" == "1" ]]; then
-    cmd+=(--no_refresh_context_each_epoch)
   fi
 
   set +e

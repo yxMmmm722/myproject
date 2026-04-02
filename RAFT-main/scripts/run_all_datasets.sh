@@ -14,11 +14,10 @@ PRED_LENS_STR="${PRED_LENS:-96 192 336 720}"  # default: paper-style horizons
 ILLNESS_PRED_LENS_STR="${ILLNESS_PRED_LENS:-24 36 48 60}"  # dataset-specific default for illness
 N_PERIOD="${N_PERIOD:-3}"
 TOPM="${TOPM:-20}"
-RETRIEVAL_COARSE_K="${RETRIEVAL_COARSE_K:-80}"
 RETRIEVAL_TEMPERATURE="${RETRIEVAL_TEMPERATURE:-0.1}"
-CONTEXT_DIM="${CONTEXT_DIM:-64}"
 META_ONLY_RETRIEVAL="${META_ONLY_RETRIEVAL:-1}"  # 1: use one-shot meta-context retrieval only
 COMPARE_RETRIEVAL_TOPM="${COMPARE_RETRIEVAL_TOPM:-${COMPARE_RETRIEVAL_TOPK:-0}}"  # 1: compare top-m overlap (default off for pure meta runs)
+COMPARE_RETRIEVAL_FUTURE_QUALITY="${COMPARE_RETRIEVAL_FUTURE_QUALITY:-0}"  # 1: quantify wave/meta retrieval future quality on full split
 SAVE_RETRIEVAL_CASES="${SAVE_RETRIEVAL_CASES:-0}"  # 1: save one test case panel of wave/meta top-m histories & futures
 RETRIEVAL_CASE_PERIOD_IDX="${RETRIEVAL_CASE_PERIOD_IDX:--1}"  # -1 means last period scale
 RETRIEVAL_CASE_CHANNEL_IDX="${RETRIEVAL_CASE_CHANNEL_IDX:--1}"  # -1 means last channel
@@ -36,8 +35,6 @@ NUM_WORKERS="${NUM_WORKERS:-4}"
 MODEL_PREFIX="${MODEL_PREFIX:-HCAR}"
 USE_TABLE6_PRESETS="${USE_TABLE6_PRESETS:-1}"  # 1: use dataset/pred specific seq_len/lr/topm from Table 6
 USE_AMP="${USE_AMP:-0}"  # 1: enable --use_amp
-FREEZE_CONTEXT_ENCODER="${FREEZE_CONTEXT_ENCODER:-0}"  # 1: add --freeze_context_encoder
-NO_REFRESH_CONTEXT_EACH_EPOCH="${NO_REFRESH_CONTEXT_EACH_EPOCH:-0}"  # 1: disable context pool refresh
 RETRIEVAL_CACHE_DEVICE="${RETRIEVAL_CACHE_DEVICE:-gpu}"  # cpu|gpu
 TRAFFIC_CACHE_DEVICE="${TRAFFIC_CACHE_DEVICE:-cpu}"  # cpu|gpu, used only for traffic
 
@@ -282,18 +279,10 @@ run_one() {
 
   local model_id="${MODEL_PREFIX}_${dataset}_pl${pred_len}"
   local log_file="${LOG_DIR}/${model_id}.log"
-  local supports_retrieval_temperature=0
-  if grep -q -- "--retrieval_temperature" "${RUN_FILE}"; then
-    supports_retrieval_temperature=1
-  fi
 
   echo "============================================================"
   echo "[RUN ] dataset=${dataset} pred_len=${pred_len} channels=${channels}"
-  if [[ "${supports_retrieval_temperature}" -eq 1 ]]; then
-    echo "[CFG ] seq_len=${seq_len} lr=${learning_rate} lradj=${LRADJ} topm=${topm} temp=${RETRIEVAL_TEMPERATURE} meta_only=${META_ONLY_RETRIEVAL} cmp_topm=${COMPARE_RETRIEVAL_TOPM}:${topm} save_case=${SAVE_RETRIEVAL_CASES} case_n=${RETRIEVAL_CASE_NUM_SAMPLES} case_all_p=${RETRIEVAL_CASE_ALL_PERIODS} case_all_c=${RETRIEVAL_CASE_ALL_CHANNELS} case_fl_s=${RETRIEVAL_CASE_FIRST_LAST_SAMPLES} case_fl_b=${RETRIEVAL_CASE_FIRST_LAST_BATCHES} preset=${preset_source} cache=${retrieval_cache_device_run}"
-  else
-    echo "[CFG ] seq_len=${seq_len} lr=${learning_rate} lradj=${LRADJ} topm=${topm} temp=unsupported meta_only=${META_ONLY_RETRIEVAL} cmp_topm=${COMPARE_RETRIEVAL_TOPM}:${topm} save_case=${SAVE_RETRIEVAL_CASES} case_n=${RETRIEVAL_CASE_NUM_SAMPLES} case_all_p=${RETRIEVAL_CASE_ALL_PERIODS} case_all_c=${RETRIEVAL_CASE_ALL_CHANNELS} case_fl_s=${RETRIEVAL_CASE_FIRST_LAST_SAMPLES} case_fl_b=${RETRIEVAL_CASE_FIRST_LAST_BATCHES} preset=${preset_source} cache=${retrieval_cache_device_run}"
-  fi
+  echo "[CFG ] seq_len=${seq_len} lr=${learning_rate} lradj=${LRADJ} topm=${topm} temp=${RETRIEVAL_TEMPERATURE} meta_only=${META_ONLY_RETRIEVAL} cmp_topm=${COMPARE_RETRIEVAL_TOPM}:${topm} save_case=${SAVE_RETRIEVAL_CASES} case_n=${RETRIEVAL_CASE_NUM_SAMPLES} case_all_p=${RETRIEVAL_CASE_ALL_PERIODS} case_all_c=${RETRIEVAL_CASE_ALL_CHANNELS} case_fl_s=${RETRIEVAL_CASE_FIRST_LAST_SAMPLES} case_fl_b=${RETRIEVAL_CASE_FIRST_LAST_BATCHES} preset=${preset_source} cache=${retrieval_cache_device_run}"
   echo "[LOG ] ${log_file}"
   echo "============================================================"
 
@@ -307,31 +296,23 @@ run_one() {
     --seq_len "${seq_len}" --label_len "${LABEL_LEN}" --pred_len "${pred_len}"
     --enc_in "${channels}" --dec_in "${channels}" --c_out "${channels}"
     --n_period "${N_PERIOD}" --topm "${topm}"
-    --online_retrieval
-    --context_dim "${CONTEXT_DIM}" --retrieval_coarse_k "${RETRIEVAL_COARSE_K}"
+    --retrieval_temperature "${RETRIEVAL_TEMPERATURE}"
     --retrieval_cache_device "${retrieval_cache_device_run}"
     --batch_size "${BATCH_SIZE}" --train_epochs "${TRAIN_EPOCHS}"
     --learning_rate "${learning_rate}" --lradj "${LRADJ}" --num_workers "${num_workers_run}"
   )
 
-  if [[ "${supports_retrieval_temperature}" -eq 1 ]]; then
-    cmd+=(--retrieval_temperature "${RETRIEVAL_TEMPERATURE}")
-  fi
-
   if [[ "${USE_AMP}" == "1" ]]; then
     cmd+=(--use_amp)
-  fi
-  if [[ "${FREEZE_CONTEXT_ENCODER}" == "1" ]]; then
-    cmd+=(--freeze_context_encoder)
-  fi
-  if [[ "${NO_REFRESH_CONTEXT_EACH_EPOCH}" == "1" ]]; then
-    cmd+=(--no_refresh_context_each_epoch)
   fi
   if [[ "${META_ONLY_RETRIEVAL}" == "1" ]]; then
     cmd+=(--meta_only_retrieval)
   fi
   if [[ "${COMPARE_RETRIEVAL_TOPM}" == "1" ]]; then
     cmd+=(--compare_retrieval_topm)
+  fi
+  if [[ "${COMPARE_RETRIEVAL_FUTURE_QUALITY}" == "1" ]]; then
+    cmd+=(--compare_retrieval_future_quality)
   fi
   if [[ "${SAVE_RETRIEVAL_CASES}" == "1" ]]; then
     cmd+=(--save_retrieval_cases)

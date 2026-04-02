@@ -118,11 +118,7 @@ def main():
     parser.add_argument("--learning_rate_grid", type=str, default="1e-4,3e-4,1e-3",
                         help="comma-separated learning-rate candidates; empty means use --learning_rate")
     parser.add_argument("--topm_grid", type=str, default="1,5,10,20")
-    parser.add_argument("--coarse_k_grid", type=str, default="20,40,80,160")
     parser.add_argument("--n_period_grid", type=str, default="2,3")
-    parser.add_argument("--context_dim_grid", type=str, default="32,64,128")
-    parser.add_argument("--retrieval_alpha_grid", type=str, default="0.7",
-                        help="deprecated: kept only for CLI/result compatibility; retrieval alpha is not searched")
 
     parser.add_argument("--seq_len", type=int, default=96)
     parser.add_argument("--label_len", type=int, default=48)
@@ -136,8 +132,6 @@ def main():
     parser.add_argument("--max_trials", type=int, default=0, help="0 means no limit.")
 
     parser.add_argument("--use_amp", action="store_true")
-    parser.add_argument("--freeze_context_encoder", action="store_true")
-    parser.add_argument("--no_refresh_context_each_epoch", action="store_true")
     parser.add_argument("--selection_metric", type=str, default="vali_loss_min", choices=["vali_loss_min", "mse"],
                         help="metric used to choose best config per dataset/pred_len")
 
@@ -154,32 +148,15 @@ def main():
     lookback_grid = parse_csv_list(args.lookback_grid, int) if args.lookback_grid.strip() else [args.seq_len]
     lr_grid = parse_csv_list(args.learning_rate_grid, float) if args.learning_rate_grid.strip() else [args.learning_rate]
     topm_grid = parse_csv_list(args.topm_grid, int)
-    coarse_k_grid = parse_csv_list(args.coarse_k_grid, int)
     n_period_grid = parse_csv_list(args.n_period_grid, int)
-    context_dim_grid = parse_csv_list(args.context_dim_grid, int)
-    alpha_grid = parse_csv_list(args.retrieval_alpha_grid, float)
-    fixed_retrieval_alpha = alpha_grid[0] if alpha_grid else 0.7
 
-    # Retrieval alpha is no longer part of the search space. We keep a fixed value in the
-    # output schema for backward compatibility with downstream scripts.
     raw_grid = itertools.product(
         lookback_grid,
         lr_grid,
         topm_grid,
-        coarse_k_grid,
         n_period_grid,
-        context_dim_grid,
     )
-    # Prune redundant configs where coarse_k < topm (effective value would be max(topm, coarse_k)).
-    dedup_set = set()
-    grid = []
-    for seq_len, learning_rate, topm, coarse_k, n_period, context_dim in raw_grid:
-        eff_coarse_k = max(topm, coarse_k)
-        key = (seq_len, learning_rate, topm, eff_coarse_k, n_period, context_dim)
-        if key in dedup_set:
-            continue
-        dedup_set.add(key)
-        grid.append(key)
+    grid = list(raw_grid)
 
     if args.max_trials > 0:
         grid = grid[:args.max_trials]
@@ -187,11 +164,6 @@ def main():
     print(f"[GridSearch] project_root={project_root}")
     print(f"[GridSearch] output_dir={output_dir}")
     print(f"[GridSearch] total combinations per dataset/pred_len={len(grid)}")
-    if len(alpha_grid) > 1:
-        print(
-            f"[GridSearch] retrieval_alpha_grid={args.retrieval_alpha_grid} is deprecated and ignored. "
-            f"Using fixed retrieval_alpha={fixed_retrieval_alpha}."
-        )
 
     results = []
     trial_id = 0
@@ -210,7 +182,7 @@ def main():
         channels = infer_channels(csv_path)
 
         for pred_len in pred_lens:
-            for seq_len, learning_rate, topm, coarse_k, n_period, context_dim in grid:
+            for seq_len, learning_rate, topm, n_period in grid:
                 trial_id += 1
                 retrieval_cache_device_run = args.retrieval_cache_device
                 if dataset == "traffic":
@@ -218,7 +190,7 @@ def main():
                 model_id = (
                     f"{args.model_prefix}_{dataset}_pl{pred_len}"
                     f"_lb{seq_len}_lr{learning_rate:.0e}"
-                    f"_m{topm}_k{coarse_k}_p{n_period}_cd{context_dim}"
+                    f"_m{topm}_p{n_period}"
                 )
                 log_file = output_dir / f"{trial_id:04d}_{model_id}.log"
 
@@ -237,30 +209,22 @@ def main():
                     "--c_out", str(channels),
                     "--n_period", str(n_period),
                     "--topm", str(topm),
-                    "--retrieval_coarse_k", str(coarse_k),
-                    "--retrieval_alpha", str(fixed_retrieval_alpha),
-                    "--context_dim", str(context_dim),
                     "--retrieval_cache_device", retrieval_cache_device_run,
                     "--batch_size", str(args.batch_size),
                     "--train_epochs", str(args.train_epochs),
                     "--learning_rate", str(learning_rate),
                     "--lradj", "cosine",
                     "--num_workers", str(args.num_workers),
-                    "--online_retrieval",
                 ]
 
                 if args.use_amp:
                     cmd.append("--use_amp")
-                if args.freeze_context_encoder:
-                    cmd.append("--freeze_context_encoder")
-                if args.no_refresh_context_each_epoch:
-                    cmd.append("--no_refresh_context_each_epoch")
 
                 print("=" * 100)
                 print(
                     f"[Trial {trial_id}] dataset={dataset} pred_len={pred_len} "
-                    f"lookback={seq_len} lr={learning_rate:.0e} topm={topm} coarse_k={coarse_k} "
-                    f"n_period={n_period} context_dim={context_dim} retrieval_alpha={fixed_retrieval_alpha:.2f} "
+                    f"lookback={seq_len} lr={learning_rate:.0e} topm={topm} "
+                    f"n_period={n_period} "
                     f"cache={retrieval_cache_device_run}"
                 )
                 print(f"[Trial {trial_id}] log={log_file}")
@@ -279,10 +243,7 @@ def main():
                     "seq_len": seq_len,
                     "learning_rate": learning_rate,
                     "topm": topm,
-                    "coarse_k": coarse_k,
                     "n_period": n_period,
-                    "context_dim": context_dim,
-                    "retrieval_alpha": fixed_retrieval_alpha,
                     "channels": channels,
                     "return_code": return_code,
                     "duration_sec": round(duration, 2),
@@ -317,8 +278,8 @@ def main():
         json.dump(results, f, ensure_ascii=False, indent=2)
 
     fieldnames = [
-        "trial_id", "dataset", "pred_len", "seq_len", "learning_rate", "topm", "coarse_k", "n_period",
-        "context_dim", "retrieval_alpha", "channels", "return_code", "duration_sec",
+        "trial_id", "dataset", "pred_len", "seq_len", "learning_rate", "topm", "n_period",
+        "channels", "return_code", "duration_sec",
         "best_vali_epoch", "vali_loss_min", "train_loss_at_best_vali", "test_loss_at_best_vali",
         "mse", "mae", "dtw", "log_file"
     ]
@@ -351,10 +312,7 @@ def main():
             "lookback_window_size": row["seq_len"],
             "learning_rate": row["learning_rate"],
             "number_of_retrievals": row["topm"],
-            "coarse_k": row["coarse_k"],
             "n_period": row["n_period"],
-            "context_dim": row["context_dim"],
-            "retrieval_alpha": row["retrieval_alpha"],
             "vali_loss_min": row["vali_loss_min"],
             "best_vali_epoch": row["best_vali_epoch"],
             "mse": row["mse"],
@@ -368,7 +326,7 @@ def main():
 
     chosen_fieldnames = [
         "dataset", "pred_len", "lookback_window_size", "learning_rate", "number_of_retrievals",
-        "coarse_k", "n_period", "context_dim", "retrieval_alpha",
+        "n_period",
         "vali_loss_min", "best_vali_epoch", "mse", "mae", "trial_id", "log_file"
     ]
     with chosen_csv_path.open("w", encoding="utf-8", newline="") as f:

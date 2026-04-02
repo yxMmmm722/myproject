@@ -1,114 +1,89 @@
-import torch
+# This source code is provided for the purposes of scientific reproducibility
+# under the following limited license from Element AI Inc. The code is an
+# implementation of the N-BEATS model (Oreshkin et al., N-BEATS: Neural basis
+# expansion analysis for interpretable time series forecasting,
+# https://arxiv.org/abs/1905.10437). The copyright to the source code is
+# licensed under the Creative Commons - Attribution-NonCommercial 4.0
+# International license (CC BY-NC 4.0):
+# https://creativecommons.org/licenses/by-nc/4.0/.  Any commercial use (whether
+# for the benefit of third parties or internally in production) requires an
+# explicit license. The subject-matter of the N-BEATS model and associated
+# materials are the property of Element AI Inc. and may be subject to patent
+# protection. No license to patents is granted hereunder (whether express or
+# implied). Copyright © 2020 Element AI Inc. All rights reserved.
+
+"""
+Loss functions for PyTorch.
+"""
+
+import torch as t
 import torch.nn as nn
-import torch.nn.functional as F
+import numpy as np
+import pdb
 
 
-class QDFLiteLoss(nn.Module):
+def divide_no_nan(a, b):
     """
-    Quadratic-Direct-Forecast style loss with light-weight covariance tracking.
+    a/b where the resulted NaN or Inf are replaced by 0.
     """
+    result = a / b
+    result[result != result] = .0
+    result[result == np.inf] = .0
+    return result
 
-    def __init__(
-        self,
-        pred_len: int,
-        qdf_beta: float = 0.7,
-        qdf_warmup_epochs: int = 5,
-        qdf_diff_weight: float = 0.15,
-        qdf_level_weight: float = 0.05,
-        qdf_ema_decay: float = 0.98,
-        qdf_bandwidth: int = 32,
-        qdf_update_interval: int = 1,
-        qdf_eps: float = 1e-5,
-    ):
-        super().__init__()
-        self.pred_len = int(pred_len)
-        self.qdf_beta = float(qdf_beta)
-        self.qdf_warmup_epochs = int(max(0, qdf_warmup_epochs))
-        self.qdf_diff_weight = float(qdf_diff_weight)
-        self.qdf_level_weight = float(qdf_level_weight)
-        self.qdf_ema_decay = float(qdf_ema_decay)
-        self.qdf_bandwidth = int(qdf_bandwidth)
-        self.qdf_update_interval = int(max(1, qdf_update_interval))
-        self.qdf_eps = float(qdf_eps)
-        self.current_epoch = 0
 
-        self.register_buffer("sigma", torch.eye(self.pred_len, dtype=torch.float32))
-        self.register_buffer("update_step", torch.tensor(0, dtype=torch.long))
-        self.register_buffer("band_mask", self._build_band_mask(self.pred_len, self.qdf_bandwidth))
+class mape_loss(nn.Module):
+    def __init__(self):
+        super(mape_loss, self).__init__()
 
-    @staticmethod
-    def _build_band_mask(size: int, bandwidth: int):
-        if bandwidth <= 0 or bandwidth >= size:
-            return torch.ones((size, size), dtype=torch.float32)
-        idx = torch.arange(size)
-        dist = (idx[:, None] - idx[None, :]).abs()
-        return (dist <= bandwidth).float()
+    def forward(self, insample: t.Tensor, freq: int,
+                forecast: t.Tensor, target: t.Tensor, mask: t.Tensor) -> t.float:
+        """
+        MAPE loss as defined in: https://en.wikipedia.org/wiki/Mean_absolute_percentage_error
 
-    def set_epoch(self, epoch: int):
-        self.current_epoch = int(epoch)
+        :param forecast: Forecast values. Shape: batch, time
+        :param target: Target values. Shape: batch, time
+        :param mask: 0/1 mask. Shape: batch, time
+        :return: Loss value
+        """
+        weights = divide_no_nan(mask, target)
+        return t.mean(t.abs((forecast - target) * weights))
 
-    def _beta(self):
-        if self.qdf_warmup_epochs <= 0:
-            return self.qdf_beta
-        warm = min(1.0, float(self.current_epoch + 1) / float(self.qdf_warmup_epochs))
-        return self.qdf_beta * warm
 
-    def _apply_band(self, matrix: torch.Tensor):
-        mask = self.band_mask.to(matrix.device, dtype=matrix.dtype)
-        return matrix * mask
+class smape_loss(nn.Module):
+    def __init__(self):
+        super(smape_loss, self).__init__()
 
-    def _normalize_trace(self, matrix: torch.Tensor):
-        tr = matrix.diagonal().sum().clamp_min(self.qdf_eps)
-        return matrix * (float(self.pred_len) / tr)
+    def forward(self, insample: t.Tensor, freq: int,
+                forecast: t.Tensor, target: t.Tensor, mask: t.Tensor) -> t.float:
+        """
+        sMAPE loss as defined in https://robjhyndman.com/hyndsight/smape/ (Makridakis 1993)
 
-    @torch.no_grad()
-    def _update_sigma(self, error: torch.Tensor):
-        # error: [B, P, C] -> [B*C, P]
-        flat = error.permute(0, 2, 1).reshape(-1, self.pred_len).float()
-        if flat.shape[0] < 2:
-            return
-        flat = flat - flat.mean(dim=0, keepdim=True)
-        cov = torch.matmul(flat.transpose(0, 1), flat) / max(flat.shape[0] - 1, 1)
-        cov = self._apply_band(cov)
-        cov = 0.5 * (cov + cov.transpose(0, 1))
-        cov = cov + self.qdf_eps * torch.eye(self.pred_len, device=cov.device, dtype=cov.dtype)
-        cov = self._normalize_trace(cov)
+        :param forecast: Forecast values. Shape: batch, time
+        :param target: Target values. Shape: batch, time
+        :param mask: 0/1 mask. Shape: batch, time
+        :return: Loss value
+        """
+        return 200 * t.mean(divide_no_nan(t.abs(forecast - target),
+                                          t.abs(forecast.data) + t.abs(target.data)) * mask)
 
-        sigma = self.sigma.to(cov.device)
-        sigma = self.qdf_ema_decay * sigma + (1.0 - self.qdf_ema_decay) * cov
-        sigma = self._apply_band(sigma)
-        sigma = 0.5 * (sigma + sigma.transpose(0, 1))
-        sigma = sigma + self.qdf_eps * torch.eye(self.pred_len, device=sigma.device, dtype=sigma.dtype)
-        sigma = self._normalize_trace(sigma)
-        self.sigma.copy_(sigma.to(self.sigma.device))
 
-    def forward(self, pred: torch.Tensor, true: torch.Tensor):
-        pred = pred.float()
-        true = true.float()
-        error = pred - true
+class mase_loss(nn.Module):
+    def __init__(self):
+        super(mase_loss, self).__init__()
 
-        mse = F.mse_loss(pred, true)
+    def forward(self, insample: t.Tensor, freq: int,
+                forecast: t.Tensor, target: t.Tensor, mask: t.Tensor) -> t.float:
+        """
+        MASE loss as defined in "Scaled Errors" https://robjhyndman.com/papers/mase.pdf
 
-        sigma = self.sigma.to(error.device, dtype=error.dtype)
-        flat = error.permute(0, 2, 1).reshape(-1, self.pred_len)  # [B*C, P]
-        quadratic = torch.einsum("bp,pq,bq->b", flat, sigma, flat).mean()
-
-        if self.pred_len > 1:
-            diff_pred = pred[:, 1:, :] - pred[:, :-1, :]
-            diff_true = true[:, 1:, :] - true[:, :-1, :]
-            diff_loss = F.smooth_l1_loss(diff_pred, diff_true, beta=0.1)
-        else:
-            diff_loss = torch.zeros((), device=pred.device, dtype=pred.dtype)
-
-        level_loss = F.mse_loss(pred.mean(dim=1), true.mean(dim=1))
-
-        beta = self._beta()
-        loss = (1.0 - beta) * mse + beta * quadratic
-        loss = loss + self.qdf_diff_weight * diff_loss + self.qdf_level_weight * level_loss
-
-        if self.training:
-            self.update_step += 1
-            if int(self.update_step.item()) % self.qdf_update_interval == 0:
-                self._update_sigma(error.detach())
-
-        return loss
+        :param insample: Insample values. Shape: batch, time_i
+        :param freq: Frequency value
+        :param forecast: Forecast values. Shape: batch, time_o
+        :param target: Target values. Shape: batch, time_o
+        :param mask: 0/1 mask. Shape: batch, time_o
+        :return: Loss value
+        """
+        masep = t.mean(t.abs(insample[:, freq:] - insample[:, :-freq]), dim=1)
+        masked_masep_inv = divide_no_nan(mask, masep[:, None])
+        return t.mean(t.abs(target - forecast) * masked_masep_inv)

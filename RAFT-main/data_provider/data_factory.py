@@ -66,24 +66,10 @@ def hcar_collate_fn(batch):
     seq_x_mark = torch.from_numpy(np.stack([_safe_float_array(xm) for xm in seq_x_mark], axis=0))
     seq_y_mark = torch.from_numpy(np.stack([_safe_float_array(ym) for ym in seq_y_mark], axis=0))
 
-    meta_keys = [
-        "dataset_id",
-        "sensor_type_id",
-        "physical_location_id",
-        "hour",
-        "day_of_week",
-        "month",
-        "is_holiday",
-        "peak_status_id",
-    ]
-    meta_batch = {k: [] for k in meta_keys}
     local_state_batch = []
 
     for md in meta_data:
         md = md or {}
-        for k in meta_keys:
-            meta_batch[k].append(int(md.get(k, 0)))
-
         local_state = np.asarray(md.get("local_state_by_period", np.zeros((3, 4), dtype=np.float32)))
         if local_state.ndim == 1:
             local_state = local_state.reshape(1, -1)
@@ -100,8 +86,9 @@ def hcar_collate_fn(batch):
             )
         local_state_batch.append(local_state[:3, :4])
 
-    meta_batch = {k: torch.tensor(v, dtype=torch.long) for k, v in meta_batch.items()}
-    meta_batch["local_state_by_period"] = torch.from_numpy(np.stack(local_state_batch, axis=0).astype(np.float32))
+    meta_batch = {
+        "local_state_by_period": torch.from_numpy(np.stack(local_state_batch, axis=0).astype(np.float32))
+    }
 
     return index, seq_x, seq_y, seq_x_mark, seq_y_mark, meta_batch
 
