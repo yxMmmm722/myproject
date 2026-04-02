@@ -11,38 +11,32 @@ from utils.timefeatures import time_features
 from sktime.datasets import load_from_tsfile_to_dataframe
 import warnings
 from utils.augmentation import run_augmentation_single
-from utils.prompt_factory import infer_dataset_name, build_meta_record
+from utils.prompt_factory import build_meta_record
 
 warnings.filterwarnings('ignore')
 
 
 def _compact_numeric_meta(meta_data):
     """Keep only the local periodic state used by the current model path."""
-    local_state = np.asarray(meta_data.get("local_state_by_period", np.zeros((3, 4), dtype=np.float32)), dtype=np.float32)
+    local_state = np.asarray(meta_data.get("local_state_by_period", np.zeros((3, 1, 4), dtype=np.float32)), dtype=np.float32)
     if local_state.ndim == 1:
-        local_state = local_state.reshape(1, -1)
+        local_state = local_state.reshape(1, 1, -1)
+    elif local_state.ndim == 2:
+        local_state = local_state[:, np.newaxis, :]
     if local_state.shape[0] < 3:
-        pad = np.zeros((3 - local_state.shape[0], local_state.shape[1]), dtype=np.float32)
+        pad = np.zeros((3 - local_state.shape[0], local_state.shape[1], local_state.shape[2]), dtype=np.float32)
         local_state = np.concatenate([local_state, pad], axis=0)
-    if local_state.shape[1] < 4:
-        pad = np.zeros((local_state.shape[0], 4 - local_state.shape[1]), dtype=np.float32)
-        local_state = np.concatenate([local_state, pad], axis=1)
-    local_state = local_state[:3, :4].astype(np.float32)
+    if local_state.shape[2] < 4:
+        pad = np.zeros((local_state.shape[0], local_state.shape[1], 4 - local_state.shape[2]), dtype=np.float32)
+        local_state = np.concatenate([local_state, pad], axis=2)
+    local_state = local_state[:3, :, :4].astype(np.float32)
 
     return {"local_state_by_period": local_state}
 
 
 def build_sample_meta(dataset, index, seq_x):
-    s_end = index + dataset.seq_len
-    anchor_idx = min(s_end - 1, len(dataset.date_index) - 1)
-    timestamp = dataset.date_index.iloc[anchor_idx]
-    meta_data = build_meta_record(
-        timestamp=timestamp,
-        dataset_name=dataset.dataset_name,
-        target=dataset.target,
-        feature_names=dataset.feature_names,
-        seq_x=seq_x,
-    )
+    del dataset, index
+    meta_data = build_meta_record(seq_x=seq_x)
     return _compact_numeric_meta(meta_data)
 
 
@@ -119,8 +113,6 @@ class Dataset_ETT_hour(Dataset):
             self.data_x, self.data_y, augmentation_tags = run_augmentation_single(self.data_x, self.data_y, self.args)
 
         self.data_stamp = data_stamp
-        self.date_index = pd.to_datetime(df_stamp['date']).reset_index(drop=True)
-        self.dataset_name = infer_dataset_name(self.args, self.data_path)
         self.feature_dim = self.data_x.shape[1]
         self.feature_names = list(df_data.columns)
 
@@ -220,8 +212,6 @@ class Dataset_ETT_minute(Dataset):
             self.data_x, self.data_y, augmentation_tags = run_augmentation_single(self.data_x, self.data_y, self.args)
 
         self.data_stamp = data_stamp
-        self.date_index = pd.to_datetime(df_stamp['date']).reset_index(drop=True)
-        self.dataset_name = infer_dataset_name(self.args, self.data_path)
         self.feature_dim = self.data_x.shape[1]
         self.feature_names = list(df_data.columns)
 
@@ -329,8 +319,6 @@ class Dataset_Custom(Dataset):
             self.data_x, self.data_y, augmentation_tags = run_augmentation_single(self.data_x, self.data_y, self.args)
 
         self.data_stamp = data_stamp
-        self.date_index = pd.to_datetime(df_stamp['date']).reset_index(drop=True)
-        self.dataset_name = infer_dataset_name(self.args, self.data_path)
         self.feature_dim = self.data_x.shape[1]
         self.feature_names = list(df_data.columns)
 

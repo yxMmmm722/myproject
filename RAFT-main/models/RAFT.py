@@ -42,7 +42,6 @@ class Model(nn.Module):
         self.period_attn_dim = getattr(configs, "period_router_hidden_dim", 128)
         self.period_query_proj = nn.Linear(self.pred_len, self.period_attn_dim)
         self.period_key_proj = nn.Linear(self.pred_len, self.period_attn_dim)
-        self.period_meta_proj = nn.Linear(4, self.period_attn_dim)
         self.period_attn_dropout = nn.Dropout(getattr(configs, "period_attn_dropout", 0.0))
         self.period_attn_scale = self.period_attn_dim ** -0.5
         # One-shot base/retrieval fusion after cross-scale retrieval aggregation.
@@ -104,40 +103,6 @@ class Model(nn.Module):
             train=train,
         )
 
-    def _extract_local_state_feature(self, meta_data, bsz, device):
-        gsz = len(self.period_num)
-        out = torch.zeros((bsz, gsz, 4), device=device)
-        if not isinstance(meta_data, dict):
-            return out
-
-        local_state = meta_data.get("local_state_by_period", None)
-        if local_state is None:
-            return out
-
-        if torch.is_tensor(local_state):
-            local_state = local_state.float()
-        else:
-            local_state = torch.tensor(local_state, dtype=torch.float32)
-
-        if local_state.dim() == 2:
-            local_state = local_state.unsqueeze(0)
-        if local_state.shape[0] == 1 and bsz > 1:
-            local_state = local_state.repeat(bsz, 1, 1)
-        if local_state.shape[0] > bsz:
-            local_state = local_state[:bsz]
-        if local_state.shape[0] < bsz:
-            pad = torch.zeros((bsz - local_state.shape[0], local_state.shape[1], local_state.shape[2]))
-            local_state = torch.cat([local_state, pad], dim=0)
-        if local_state.shape[1] < gsz:
-            pad = torch.zeros((bsz, gsz - local_state.shape[1], local_state.shape[2]))
-            local_state = torch.cat([local_state, pad], dim=1)
-        if local_state.shape[2] < 4:
-            pad = torch.zeros((bsz, local_state.shape[1], 4 - local_state.shape[2]))
-            local_state = torch.cat([local_state, pad], dim=2)
-
-        local_state = local_state[:, :gsz, :4].to(device)
-        return local_state
-
     def encoder(self, x, index, mode, meta_data=None):
         bsz, seq_len, channels = x.shape
         assert seq_len == self.seq_len and channels == self.channels
@@ -180,12 +145,6 @@ class Model(nn.Module):
         gsz = len(self.period_num)
         key_token = self.period_key_proj(
             period_signal.reshape(bsz * channels * gsz, self.pred_len)
-        ).reshape(bsz, channels, gsz, self.period_attn_dim)  # B, C, G, D
-
-        local_state_feature = self._extract_local_state_feature(meta_data, bsz, x.device)  # B, G, 4
-        local_state_feature = local_state_feature.unsqueeze(1).expand(-1, channels, -1, -1)  # B, C, G, 4
-        key_token = key_token + self.period_meta_proj(
-            local_state_feature.reshape(bsz * channels * gsz, 4)
         ).reshape(bsz, channels, gsz, self.period_attn_dim)  # B, C, G, D
 
         period_logits = torch.matmul(
