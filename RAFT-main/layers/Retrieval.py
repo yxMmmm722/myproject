@@ -121,6 +121,22 @@ class RetrievalTool(nn.Module):
 
         return mg, offset
 
+    def _recommend_query_batch_size(self, max_batch):
+        max_batch = max(1, int(max_batch))
+        if self.n_train is None or self.n_train <= 0:
+            return max_batch
+
+        # Meta retrieval allocates tensors shaped roughly [G, B, C, T].
+        # Keep the dominant temporary under ~512MB assuming ~2x working-set overhead.
+        target_bytes = 512 * 1024 * 1024
+        denom = max(1, self.n_period * self.channels * self.n_train * 4 * 2)
+        suggested = max(1, int(target_bytes // denom))
+
+        if self.low_mem_stream:
+            suggested = min(suggested, 64)
+
+        return max(1, min(max_batch, suggested))
+
     def _extract_channel_state(self, mg):
         # mg: [G, N, S, C] -> state: [G, N, C, 4]
         mean = mg.mean(dim=2)
@@ -595,9 +611,11 @@ class RetrievalTool(nn.Module):
     def retrieve_all(self, data, train=False, device=torch.device("cpu")):
         assert (self.train_data_all_mg is not None) or (self.train_series_x is not None)
 
+        query_batch_size = self._recommend_query_batch_size(max_batch=1024)
+
         rt_loader = DataLoader(
             data,
-            batch_size=1024,
+            batch_size=query_batch_size,
             shuffle=False,
             num_workers=0 if self.low_mem_stream else 8,
             drop_last=False,
@@ -627,9 +645,11 @@ class RetrievalTool(nn.Module):
         Compare wave-retrieved future vs meta-retrieved future against true future
         in the same multi-scale decomposition space.
         """
+        query_batch_size = self._recommend_query_batch_size(max_batch=512)
+
         loader = DataLoader(
             data,
-            batch_size=512,
+            batch_size=query_batch_size,
             shuffle=False,
             num_workers=0 if self.low_mem_stream else 4,
             drop_last=False,

@@ -70,23 +70,21 @@ def hcar_collate_fn(batch):
 
     for md in meta_data:
         md = md or {}
-        local_state = np.asarray(md.get("local_state_by_period", np.zeros((3, 1, 4), dtype=np.float32)))
+        local_state = np.asarray(md.get("local_state_by_period", np.zeros((3, 4), dtype=np.float32)))
         if local_state.ndim == 1:
-            local_state = local_state.reshape(1, 1, -1)
-        elif local_state.ndim == 2:
-            local_state = local_state[:, np.newaxis, :]
+            local_state = local_state.reshape(1, -1)
         local_state = _safe_float_array(local_state)
         if local_state.shape[0] < 3:
             local_state = np.concatenate(
-                [local_state, np.zeros((3 - local_state.shape[0], local_state.shape[1], local_state.shape[2]), dtype=np.float32)],
+                [local_state, np.zeros((3 - local_state.shape[0], local_state.shape[1]), dtype=np.float32)],
                 axis=0,
             )
-        if local_state.shape[2] < 4:
+        if local_state.shape[1] < 4:
             local_state = np.concatenate(
-                [local_state, np.zeros((local_state.shape[0], local_state.shape[1], 4 - local_state.shape[2]), dtype=np.float32)],
-                axis=2,
+                [local_state, np.zeros((local_state.shape[0], 4 - local_state.shape[1]), dtype=np.float32)],
+                axis=1,
             )
-        local_state_batch.append(local_state[:3, :, :4])
+        local_state_batch.append(local_state[:3, :4])
 
     meta_batch = {
         "local_state_by_period": torch.from_numpy(np.stack(local_state_batch, axis=0).astype(np.float32))
