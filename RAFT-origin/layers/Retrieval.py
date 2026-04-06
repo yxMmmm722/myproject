@@ -41,16 +41,19 @@ class RetrievalTool(nn.Module):
 
         self.train_data_all_mg = None
         self.train_channel_state_mg = None
+        self.train_time_key = None
         self.y_data_all_mg = None
         self.n_train = 0
 
     def prepare_dataset(self, train_data):
         train_data_all = []
         y_data_all = []
+        train_mark_all = []
 
         for i in range(len(train_data)):
             td = train_data[i]
             train_data_all.append(td[1])
+            train_mark_all.append(td[3])
             if self.with_dec:
                 y_data_all.append(td[2][-(train_data.pred_len + train_data.label_len):])
             else:
@@ -59,6 +62,8 @@ class RetrievalTool(nn.Module):
         train_data_all = torch.tensor(np.stack(train_data_all, axis=0)).float()
         self.train_data_all_mg, _ = self.decompose_mg(train_data_all)
         self.train_channel_state_mg = self._extract_channel_state(self.train_data_all_mg)
+        train_mark_all = torch.tensor(np.stack(train_mark_all, axis=0)).float()
+        self.train_time_key = self._extract_time_key(train_mark_all)
 
         y_data_all = torch.tensor(np.stack(y_data_all, axis=0)).float()
         self.y_data_all_mg, _ = self.decompose_mg(y_data_all)
@@ -98,6 +103,18 @@ class RetrievalTool(nn.Module):
             abs_diff = torch.zeros_like(mean)
         return torch.stack([mean, std, slope, abs_diff], dim=-1)
 
+    def _extract_time_key(self, mark):
+        if mark is None:
+            return None
+        if not torch.is_tensor(mark):
+            mark = torch.tensor(mark)
+        mark = mark.float()
+        if mark.dim() == 3:
+            return mark[:, -1, :]
+        if mark.dim() == 2:
+            return mark
+        raise ValueError(f"Unsupported mark shape for time key extraction: {tuple(mark.shape)}")
+
     def _meta_channel_similarity(self, query_channel_state, self_mask=None):
         # query_channel_state: [G, B, C, 4] -> similarity: [G, B, C, T]
         q = F.normalize(query_channel_state, dim=-1)
@@ -107,6 +124,26 @@ class RetrievalTool(nn.Module):
         if self_mask is not None:
             sim = sim.masked_fill(self_mask.unsqueeze(2), float("-inf"))
         return sim
+
+    def _build_time_filter_mask(self, meta_query, select_k, device):
+        if meta_query is None or self.train_time_key is None or self.n_train <= 0:
+            return None
+
+        query_key = self._extract_time_key(meta_query).to(device)
+        bank_key = self.train_time_key.to(device)
+
+        horizon_ratio = min(1.0, float(self.pred_len) / max(float(self.seq_len), 1.0))
+        keep_multiplier = int(round(8 + 16 * (1.0 - horizon_ratio)))
+        min_keep = int(round(256 + 512 * (1.0 - horizon_ratio)))
+        keep_k = min(self.n_train, max(select_k * keep_multiplier, min_keep))
+        if keep_k >= self.n_train:
+            return None
+
+        dist = torch.cdist(query_key, bank_key, p=2)
+        keep_idx = torch.topk(dist, k=keep_k, dim=1, largest=False).indices
+        mask = torch.ones((query_key.shape[0], self.n_train), device=device, dtype=torch.bool)
+        mask.scatter_(1, keep_idx, False)
+        return mask.unsqueeze(0).expand(self.n_period, -1, -1)
 
     def periodic_batch_corr(self, data_all, key, in_bsz=512):
         _, _, _ = key.shape
@@ -138,7 +175,7 @@ class RetrievalTool(nn.Module):
         self_mask = self_mask.unsqueeze(0).repeat(self.n_period, 1, 1)
         return self_mask.bool()
 
-    def _compute_wave_and_meta_topm(self, x, index, train=True):
+    def _compute_wave_and_meta_topm(self, x, index, meta_query=None, train=True):
         bsz, seq_len, channels = x.shape
         assert seq_len == self.seq_len and channels == self.channels
 
@@ -146,20 +183,24 @@ class RetrievalTool(nn.Module):
         self_mask = None
         if train:
             self_mask = self._build_train_self_mask(index, bsz, x.device)
+        time_mask = self._build_time_filter_mask(meta_query, select_k, x.device)
+        candidate_mask = self_mask
+        if time_mask is not None:
+            candidate_mask = time_mask if candidate_mask is None else (candidate_mask | time_mask)
 
         x_mg, _ = self.decompose_mg(x)  # [G, B, S, C]
 
         x_wave = x_mg.flatten(start_dim=2)  # [G, B, S*C]
         bank_wave = self.train_data_all_mg.flatten(start_dim=2).to(x.device)  # [G, T, S*C]
         sim_wave = self.periodic_batch_corr(bank_wave, x_wave)  # [G, B, T]
-        if self_mask is not None:
-            sim_wave = sim_wave.masked_fill(self_mask, float("-inf"))
+        if candidate_mask is not None:
+            sim_wave = sim_wave.masked_fill(candidate_mask, float("-inf"))
         wave_score_raw, wave_idx_raw = torch.topk(sim_wave, k=select_k, dim=2)  # [G, B, k]
         wave_idx = wave_idx_raw.unsqueeze(2).expand(-1, -1, channels, -1)  # [G, B, C, k]
         wave_score = wave_score_raw.unsqueeze(2).expand(-1, -1, channels, -1)  # [G, B, C, k]
 
         query_channel_state = self._extract_channel_state(x_mg)  # [G, B, C, 4]
-        meta_sim = self._meta_channel_similarity(query_channel_state, self_mask=self_mask)  # [G, B, C, T]
+        meta_sim = self._meta_channel_similarity(query_channel_state, self_mask=candidate_mask)  # [G, B, C, T]
         meta_score, meta_idx = torch.topk(meta_sim, k=select_k, dim=3)  # [G, B, C, k]
 
         return {
@@ -171,12 +212,11 @@ class RetrievalTool(nn.Module):
         }
 
     def retrieve(self, x, index, meta_query=None, train=True):
-        del meta_query
         bsz, seq_len, channels = x.shape
         assert seq_len == self.seq_len and channels == self.channels
         index = index.to(x.device)
 
-        out = self._compute_wave_and_meta_topm(x=x, index=index, train=train)
+        out = self._compute_wave_and_meta_topm(x=x, index=index, meta_query=meta_query, train=train)
         selected_idx = out["meta_idx"] if self.meta_only_retrieval else out["wave_idx"]
         base_score = out["meta_score"] if self.meta_only_retrieval else out["wave_score"]
         ranking_prob = F.softmax(base_score / self.temperature, dim=-1)  # [G, B, C, k]
@@ -222,7 +262,10 @@ class RetrievalTool(nn.Module):
         with torch.no_grad():
             for batch in tqdm(rt_loader):
                 index, batch_x = batch[0], batch[1]
-                pred_from_retrieval = self.retrieve(batch_x.float().to(device), index, train=train)
+                batch_x_mark = batch[3] if len(batch) > 3 else None
+                if batch_x_mark is not None:
+                    batch_x_mark = batch_x_mark.float().to(device)
+                pred_from_retrieval = self.retrieve(batch_x.float().to(device), index, meta_query=batch_x_mark, train=train)
                 retrievals.append(pred_from_retrieval.cpu())
 
         retrievals = torch.cat(retrievals, dim=1)
@@ -263,15 +306,18 @@ class RetrievalTool(nn.Module):
 
         for batch in tqdm(loader):
             index, batch_x, batch_y = batch[0], batch[1], batch[2]
+            batch_x_mark = batch[3] if len(batch) > 3 else None
             batch_x = batch_x.float().to(device)
+            if batch_x_mark is not None:
+                batch_x_mark = batch_x_mark.float().to(device)
             batch_y_future = batch_y[:, -self.pred_len:, :].float().to(device)
             true_mg, _ = self.decompose_mg(batch_y_future)  # [G, B, P, C]
 
             self.meta_only_retrieval = False
-            wave_pred = self.retrieve(batch_x, index, train=train)  # [G, B, P, C]
+            wave_pred = self.retrieve(batch_x, index, meta_query=batch_x_mark, train=train)  # [G, B, P, C]
 
             self.meta_only_retrieval = True
-            meta_pred = self.retrieve(batch_x, index, train=train)  # [G, B, P, C]
+            meta_pred = self.retrieve(batch_x, index, meta_query=batch_x_mark, train=train)  # [G, B, P, C]
 
             wave_err = wave_pred - true_mg
             meta_err = meta_pred - true_mg
